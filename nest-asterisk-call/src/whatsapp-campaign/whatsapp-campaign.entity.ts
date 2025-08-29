@@ -10,6 +10,8 @@ export class WhatsappCampaign {
     @Column()
     name: string;
 
+    @Column({ type: 'text', nullable: true })
+    messageBody: string;
     @Column({ type: 'timestamp', comment: 'Fecha programada para el envío' })
     sendDate: Date;
     

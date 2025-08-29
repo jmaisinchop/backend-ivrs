@@ -8,10 +8,17 @@ import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { Res } from '@nestjs/common';
 import { Response } from 'express';
+
 @UseGuards(AuthGuard('jwt'), RolesGuard)
 @Controller('stats')
 export class StatsController {
   constructor(private readonly stats: StatsService) { }
+
+  @Get('dashboard-overview')
+  dashboardOverview(@Req() req) {
+    const userId = this._uid(req);
+    return this.stats.getDashboardOverview(userId);
+  }
 
   /* ---------- OVERVIEW ---------- */
   @Get('overview')
@@ -24,22 +31,22 @@ export class StatsController {
   /* ---------- SERIES ---------- */
   @Get('calls/daily')
   callsDaily(@Query('days') d = '30', @Req() req) {
-    return this.stats.getCallsPerDay(+d, req.user.role === 'CALLCENTER' ? req.user.id : undefined);
+    return this.stats.getCallsPerDay(+d, this._uid(req));
   }
 
   @Get('calls/monthly')
   callsMonthly(@Query('months') m = '12', @Req() req) {
-    return this.stats.getCallsPerMonth(+m, req.user.role === 'CALLCENTER' ? req.user.id : undefined);
+    return this.stats.getCallsPerMonth(+m, this._uid(req));
   }
 
   @Get('calls/hourly')
   callsHourly(@Query('days') d = '7', @Req() req) {
-    return this.stats.getCallsPerHour(+d, req.user.role === 'CALLCENTER' ? req.user.id : undefined);
+    return this.stats.getCallsPerHour(+d, this._uid(req));
   }
 
   @Get('calls/success-trend')
   successTrend(@Query('days') d = '30', @Req() req) {
-    return this.stats.getSuccessTrend(+d, req.user.role === 'CALLCENTER' ? req.user.id : undefined);
+    return this.stats.getSuccessTrend(+d, this._uid(req));
   }
 
   /* ---------- EXTRAS ---------- */
@@ -72,6 +79,16 @@ export class StatsController {
   @Get('campaigns/leaderboard')
   leaderboard(@Query('limit') l = '5', @Req() req) {
     return this.stats.getCampaignLeaderboard(+l, this._uid(req));
+  }
+
+  /**
+   * ✅ NUEVO: Endpoint para el análisis de rendimiento y predicción de agentes.
+   * Restringido solo para roles de gestión.
+   */
+  @Get('agents/leaderboard')
+  @Roles('ADMIN', 'SUPERVISOR')
+  getAgentLeaderboard(@Query('days') days = '30') {
+      return this.stats.getAgentLeaderboard(+days);
   }
 
   /* ---------- CANALES ---------- */
@@ -132,7 +149,7 @@ export class StatsController {
     return this.stats.getCampaignSummary(
       start,
       end,
-      req.user.role === 'CALLCENTER' ? req.user.id : undefined,
+      this._uid(req),
     );
   }
 
@@ -149,7 +166,7 @@ export class StatsController {
     const buffer = await this.stats.generateCampaignReport(
       start,
       end,
-      req.user.role === 'CALLCENTER' ? req.user.id : undefined,
+      this._uid(req),
     );
 
     res.setHeader(
@@ -161,6 +178,6 @@ export class StatsController {
       `attachment; filename="campañas_${start}_a_${end}.xlsx"`,
     );
 
-    res.end(buffer);   // se envía el binario y se cierra la respuesta
+    res.end(buffer);
   }
 }

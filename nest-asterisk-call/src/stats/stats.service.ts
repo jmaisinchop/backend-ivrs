@@ -1,10 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, In, LessThan } from 'typeorm';
 import { Campaign } from '../campaign/campaign.entity';
 import { Contact } from '../campaign/contact.entity';
 import { ChannelLimit } from '../channel-limit/channel-limit.entity';
 import * as ExcelJS from 'exceljs';
+import { WhatsappCampaign } from '../whatsapp-campaign/whatsapp-campaign.entity';
+import { WhatsappContact } from '../whatsapp-campaign/whatsapp-contact.entity';
 
 @Injectable()
 export class StatsService {
@@ -12,24 +14,26 @@ export class StatsService {
     @InjectRepository(Campaign) private campRepo: Repository<Campaign>,
     @InjectRepository(Contact) private contactRepo: Repository<Contact>,
     @InjectRepository(ChannelLimit) private limitRepo: Repository<ChannelLimit>,
+    @InjectRepository(WhatsappCampaign) private whatsappCampRepo: Repository<WhatsappCampaign>,
+    @InjectRepository(WhatsappContact) private whatsappContactRepo: Repository<WhatsappContact>,
   ) { }
 
   /* --------------------------------------------------------- *
-   *  HELPERS
+   * HELPERS
    * --------------------------------------------------------- */
   /** añade filtro por creador casteando AMBOS lados a uuid */
   private createdBy(idx: number) {
     return `AND c."createdBy"::uuid = $${idx}::uuid`;
   }
-  /**   ⇢ compara el createdBy convirtiendo la columna a texto   */
+  /** ⇢ compara el createdBy convirtiendo la columna a texto   */
   private createdByTxt(idx: number) {
-    /*        columna uuid → text   |   $idx sigue siendo texto  */
+    /* columna uuid → text   |   $idx sigue siendo texto  */
     return `AND c."createdBy"::text = $${idx}`;
   }
 
 
   /* --------------------------------------------------------- *
-   *  SERIES BÁSICAS
+   * SERIES BÁSICAS
    * --------------------------------------------------------- */
   getCallsPerDay(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
@@ -104,7 +108,7 @@ export class StatsService {
   }
 
   /* --------------------------------------------------------- *
-   *  MÉTRICAS EXTRA
+   * MÉTRICAS EXTRA
    * --------------------------------------------------------- */
   getCallStatusDistribution(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
@@ -342,7 +346,7 @@ export class StatsService {
   }
 
   /* --------------------------------------------------------- *
-   *  RANKINGS & OVERVIEW
+   * RANKINGS & OVERVIEW
    * --------------------------------------------------------- */
   getAgentPerformance(days = 30, userId?: string) {
     const userFilter = userId ? `WHERE u.id = $2::uuid` : '';
@@ -407,7 +411,7 @@ export class StatsService {
                END,4)                                          AS successrate
       FROM campaign c
       LEFT JOIN contact ct ON ct."campaignId" = c.id
-      ${where}                -- 2️⃣  el filtro vive aquí
+      ${where}
       GROUP BY c.id, c.name
       ORDER BY successrate DESC, total DESC
       LIMIT $1;
@@ -416,11 +420,9 @@ export class StatsService {
     );
   }
 
-
-
   /* ---------- overview ---------- */
   async getOverview(userId?: string) {
-    const extra = userId ? this.createdBy(1) : '';
+    const extra = userId ? `WHERE c."createdBy"::uuid = $1::uuid` : '';
     const params = userId ? [userId] : [];
 
     const [{ active }] = await this.campRepo.query(
@@ -432,7 +434,7 @@ export class StatsService {
       SELECT COUNT(*)::INT AS calling
       FROM contact ct
       JOIN campaign c ON c.id = ct."campaignId"
-      WHERE ct."callStatus"='CALLING' ${extra};
+      WHERE ct."callStatus"='CALLING' ${extra.replace('c.', 'c.')};
       `,
       params,
     );
@@ -443,14 +445,14 @@ export class StatsService {
              END AS sr
       FROM contact ct
       JOIN campaign c ON c.id = ct."campaignId"
-      WHERE 1=1 ${extra};
+      WHERE 1=1 ${extra.replace('c.', 'c.')};
       `,
       params,
     );
 
     if (userId) {
       const [lim] = await this.limitRepo.query(
-        `SELECT "maxChannels"::INT AS max,"usedChannels"::INT AS used FROM channel_limit WHERE "userId"=$1`,
+        `SELECT "maxChannels"::INT AS max,"usedChannels"::INT AS used FROM channel_limit WHERE "userId"::text = $1`,
         [userId],
       );
       return {
@@ -481,16 +483,17 @@ export class StatsService {
       },
     };
   }
+  
   /* =====================================================================
         RESUMEN DE CAMPAÑAS – utilizado por la tabla y el Excel
      ===================================================================== */
   async getCampaignSummary(
-    start: string,            // YYYY-MM-DD
-    end: string,            // YYYY-MM-DD
-    userId?: string,           // solo para CALLCENTER
+    start: string,
+    end: string,
+    userId?: string,
   ) {
     const params: string[] = [start, end];
-    const filter = userId ? this.createdByTxt(3) : '';   // ← opcional
+    const filter = userId ? this.createdByTxt(3) : '';
     if (userId) params.push(userId);
 
     return this.contactRepo.query(
@@ -499,42 +502,30 @@ export class StatsService {
           c.id,
           c.name,
           c.status,
-  
-          /* ventana de ejecución  (solo mostramos fecha) */
-          TO_CHAR(c."startDate", 'YYYY-MM-DD')                             AS start,
-          TO_CHAR(c."endDate"  , 'YYYY-MM-DD')                             AS "end",
-          ROUND(EXTRACT(EPOCH FROM (c."endDate" - c."startDate"))/3600,2)  AS hours,
-  
-          COALESCE(u.username,'-')                                         AS created_by,
-  
-          /* métricas */
-          COUNT(ct.id)::INT                                                AS total,
-          COUNT(*) FILTER (WHERE ct."callStatus"='SUCCESS')::INT           AS success,
-          COUNT(*) FILTER (WHERE ct."callStatus"='FAILED')::INT            AS failed,
+          TO_CHAR(c."startDate", 'YYYY-MM-DD') AS start,
+          TO_CHAR(c."endDate", 'YYYY-MM-DD') AS "end",
+          ROUND(EXTRACT(EPOCH FROM (c."endDate" - c."startDate"))/3600,2) AS hours,
+          COALESCE(u.username,'-') AS created_by,
+          COUNT(ct.id)::INT AS total,
+          COUNT(*) FILTER (WHERE ct."callStatus"='SUCCESS')::INT AS success,
+          COUNT(*) FILTER (WHERE ct."callStatus"='FAILED')::INT AS failed,
           COUNT(*) FILTER (
               WHERE ct."callStatus" NOT IN ('SUCCESS','FAILED')
-          )::INT                                                           AS pending,
-  
-          SUM(ct."attemptCount")::INT                                      AS attempts,
-          ROUND(AVG(ct."attemptCount")::NUMERIC,2)                         AS avg_attempts,
-          COUNT(*) FILTER (WHERE ct."attemptCount" > 1)::INT               AS with_retry,
-  
+          )::INT AS pending,
+          SUM(ct."attemptCount")::INT AS attempts,
+          ROUND(AVG(ct."attemptCount")::NUMERIC,2) AS avg_attempts,
+          COUNT(*) FILTER (WHERE ct."attemptCount" > 1)::INT AS with_retry,
           ROUND(
             CASE WHEN COUNT(*) = 0 THEN 0
-                 ELSE COUNT(*) FILTER (WHERE ct."callStatus"='SUCCESS')::NUMERIC
-                      / COUNT(*)
+                 ELSE COUNT(*) FILTER (WHERE ct."callStatus"='SUCCESS')::NUMERIC / COUNT(*)
             END, 4
-          )                                                                AS success_rate
-  
+          ) AS success_rate
         FROM campaign c
         LEFT JOIN contact ct ON ct."campaignId" = c.id
-        LEFT JOIN "user" u   ON u.id            = c."createdBy"::uuid
-  
-        /*  ⬇️ intervalo inclusivo: solo se mira la parte «date» */
+        LEFT JOIN "user" u ON u.id = c."createdBy"::uuid
         WHERE c."startDate"::date >= $1::date
           AND c."startDate"::date <= $2::date
           ${filter}
-  
         GROUP BY c.id, u.username
         ORDER BY c."startDate";
         `,
@@ -575,14 +566,95 @@ export class StatsService {
 
     data.forEach((row, i) => ws.addRow({ idx: i + 1, ...row }));
 
-    ['L'].forEach(col => {           // solo la columna «Éxito %»
+    ['L'].forEach(col => {
       ws.getColumn(col).numFmt = '0.00%';
     });
     ws.getRow(1).font = { bold: true };
     ws.autoFilter = { from: 'A1', to: 'O1' };
 
-    return wb.xlsx.writeBuffer();   // -> Buffer
+    return wb.xlsx.writeBuffer();
   }
 
+  /**
+   * ✅ NUEVO: Obtiene un resumen agregado de las campañas de WhatsApp.
+   */
+  async getWhatsappStats(userId?: string) {
+    const campaignQuery = this.whatsappCampRepo.createQueryBuilder('campaign');
+    if (userId) {
+      campaignQuery.where('campaign."createdBy" = :userId', { userId });
+    }
+    
+    const activeCampaigns = await campaignQuery.clone().andWhere("campaign.status IN ('RUNNING', 'PAUSED')").getCount();
+    
+    const statsQuery = this.whatsappContactRepo.createQueryBuilder('contact')
+      .select('contact.status', 'status')
+      .addSelect('COUNT(*)::int', 'count')
+      .innerJoin('contact.campaign', 'campaign');
 
+    if (userId) {
+      statsQuery.where('campaign."createdBy" = :userId', { userId });
+    }
+    
+    const stats = await statsQuery.groupBy('contact.status').getRawMany();
+
+    const statsMap = stats.reduce((acc, item) => {
+        acc[item.status.toLowerCase()] = item.count;
+        return acc;
+    }, { sent: 0, pending: 0, failed: 0, sending: 0, delivered: 0, read: 0 });
+
+    return {
+        activeCampaigns,
+        ...statsMap
+    };
+  }
+
+  /**
+   * ✅ MEJORADO: Devuelve un objeto completo con estadísticas de IVR y WhatsApp.
+   */
+  async getDashboardOverview(userId?: string) {
+    const [ivrOverview, whatsappOverview] = await Promise.all([
+        this.getOverview(userId),
+        this.getWhatsappStats(userId)
+    ]);
+    
+    return {
+      ivr: ivrOverview,
+      whatsapp: whatsappOverview,
+    };
+  }
+
+  /**
+   * ✅ NUEVO: Analiza el rendimiento de los agentes y predice el mejor.
+   */
+  async getAgentLeaderboard(days = 30) {
+    const performanceData = await this.getAgentPerformance(days);
+
+    if (performanceData.length === 0) {
+      return {
+        leaderboard: [],
+        topPerformer: null,
+        averageCalls: 0,
+        averageSuccessRate: 0
+      };
+    }
+
+    const topPerformer = {
+        ...performanceData[0],
+        prediction: `Basado en su tasa de éxito del ${(performanceData[0].successrate * 100).toFixed(1)}%, ${performanceData[0].username} es el agente más efectivo.`
+    };
+    
+    const totalAgents = performanceData.length;
+    const totalCalls = performanceData.reduce((sum, agent) => sum + agent.totalcalls, 0);
+    const totalSuccessRate = performanceData.reduce((sum, agent) => sum + parseFloat(agent.successrate), 0);
+    
+    const averageCalls = totalCalls / totalAgents;
+    const averageSuccessRate = totalSuccessRate / totalAgents;
+
+    return {
+      leaderboard: performanceData,
+      topPerformer,
+      averageCalls: averageCalls.toFixed(2),
+      averageSuccessRate: (averageSuccessRate * 100).toFixed(2)
+    };
+  }
 }
