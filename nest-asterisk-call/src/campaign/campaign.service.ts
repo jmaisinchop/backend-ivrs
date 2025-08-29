@@ -15,6 +15,7 @@ import { Contact } from './contact.entity';
 import { ChannelLimitService } from 'src/channel-limit/channel-limit.service';
 import { DuplicateCampaignDto } from './dto/duplicate-campaign.dto';
 import { CreateCampaignDto } from './dto/create-campaign.dto';
+import { DashboardGateway } from 'src/dashboard/dashboard.gateway';
 
 dayjs.extend(customParseFormat);
 dayjs.extend(isBetween);
@@ -34,6 +35,7 @@ export class CampaignService {
     @Inject(forwardRef(() => AmiService))
     private readonly amiService: AmiService,
     private readonly channelLimitService: ChannelLimitService,
+    private readonly dashboardGateway: DashboardGateway,
   ) { }
 
   async createCampaign(
@@ -541,6 +543,7 @@ export class CampaignService {
     answeredAt?: Date | null,
     finishedAt?: Date | null,
   ): Promise<void> {
+    this.dashboardGateway.sendUpdate({ event: 'call-finished' });
     const contact = await this.contactRepo.findOne({ where: { id: contactId }, relations: ['campaign'] });
     if (!contact) {
       this.logger.warn(`updateContactStatusById: Contacto ${contactId} no encontrado.`);
@@ -636,7 +639,7 @@ export class CampaignService {
     });
   }
 
- async getAllCampaignsMinimal(
+  async getAllCampaignsMinimal(
     userId: string,
     role: string
   ): Promise<{
@@ -669,7 +672,7 @@ export class CampaignService {
       where: whereClause,
       order: { startDate: 'DESC' },
     });
-  }F
+  } F
 
   private buildRangeWhere(field: string, range: string) {
     // Asegurarse que el 'field' sea seguro y no permita SQL Injection si viene de input de usuario.

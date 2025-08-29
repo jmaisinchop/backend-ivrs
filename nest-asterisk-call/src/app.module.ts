@@ -19,6 +19,7 @@ import { APP_INTERCEPTOR } from '@nestjs/core';
 import { RequestContextInterceptor } from './core/request-context.interceptor';
 import { WhatsappCampaignModule } from './whatsapp-campaign/whatsapp-campaign.module';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { DashboardModule } from './dashboard/dashboard.module';
 
 @Module({
   imports: [
@@ -62,6 +63,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
     WhatsappModule,
     AuditModule,
     WhatsappCampaignModule,
+    DashboardModule,
   ],
   controllers: [AppController],
   providers: [

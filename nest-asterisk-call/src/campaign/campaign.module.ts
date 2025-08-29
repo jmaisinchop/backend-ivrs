@@ -6,12 +6,13 @@ import { CampaignService } from './campaign.service';
 import { CampaignController } from './campaign.controller';
 import { AmiModule } from '../ami/ami.module';
 import { ChannelLimitModule } from 'src/channel-limit/channel-limit.module';
-
+import { DashboardModule } from '../dashboard/dashboard.module';
 @Module({
   imports: [
     TypeOrmModule.forFeature([Campaign, Contact]),
     forwardRef(() => AmiModule),
-    ChannelLimitModule, // 👈 AQUI
+    ChannelLimitModule, 
+    DashboardModule,
 
   ],
   controllers: [CampaignController],

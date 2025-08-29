@@ -18,6 +18,38 @@ export class StatsService {
     @InjectRepository(WhatsappContact) private whatsappContactRepo: Repository<WhatsappContact>,
   ) { }
 
+  // --- 👇 FUNCIÓN AUXILIAR CORREGIDA 👇 ---
+  private async getIvrMetricsForPeriod(days: number, offsetDays: number, userId?: string) {
+    const userFilter = userId ? `AND c."createdBy"::uuid = $3::uuid` : '';
+    const params: any[] = [days, offsetDays];
+    if (userId) params.push(userId);
+    
+    // ✅ CORRECCIÓN: Se añade ::integer para especificar el tipo de dato en la operación de suma.
+    const query = `
+      SELECT
+        COUNT(DISTINCT CASE WHEN c.status IN ('RUNNING', 'PAUSED') THEN c.id END)::INT AS "activeCampaigns",
+        COUNT(CASE WHEN ct."callStatus" = 'CALLING' THEN 1 END)::INT AS "ongoingCalls",
+        COALESCE(
+          COUNT(CASE WHEN ct."callStatus" = 'SUCCESS' THEN 1 END)::DECIMAL / 
+          NULLIF(COUNT(CASE WHEN ct."callStatus" IN ('SUCCESS', 'FAILED') THEN 1 END), 0), 0
+        ) AS "successRate"
+      FROM campaign c
+      LEFT JOIN contact ct ON ct."campaignId" = c.id
+      WHERE c."startDate" BETWEEN NOW() - (($2::integer + $1::integer) * INTERVAL '1 day') AND NOW() - ($2::integer * INTERVAL '1 day')
+      ${userFilter.replace('$3', `$${params.length}`)}
+    `;
+
+    const [result] = await this.campRepo.query(query, params);
+    
+    return {
+      activeCampaigns: result ? +result.activeCampaigns : 0,
+      ongoingCalls: result ? +result.ongoingCalls : 0,
+      successRate: result ? +result.successRate : 0
+    };
+  }
+  // --- FIN DE LA CORRECCIÓN ---
+
+
   /* --------------------------------------------------------- *
    * HELPERS
    * --------------------------------------------------------- */
@@ -609,19 +641,47 @@ export class StatsService {
   }
 
   /**
-   * ✅ MEJORADO: Devuelve un objeto completo con estadísticas de IVR y WhatsApp.
+   * ✅ MEJORADO: Devuelve un objeto completo con estadísticas de IVR y WhatsApp, AHORA CON TENDENCIAS.
    */
   async getDashboardOverview(userId?: string) {
-    const [ivrOverview, whatsappOverview] = await Promise.all([
-        this.getOverview(userId),
-        this.getWhatsappStats(userId)
+    const periodDays = 30;
+    const [currentMetrics, previousMetrics, whatsappOverview] = await Promise.all([
+      this.getIvrMetricsForPeriod(periodDays, 0, userId),
+      this.getIvrMetricsForPeriod(periodDays, periodDays, userId),
+      this.getWhatsappStats(userId)
     ]);
-    
+  
+    const calculateChange = (current, previous) => {
+      if (previous === 0) return current > 0 ? Infinity : 0;
+      return ((current - previous) / previous) * 100;
+    };
+  
+    // Obtenemos los datos de canales por separado, ya que no dependen del período.
+    const overviewData = await this.getOverview(userId);
+  
+    const ivrOverview = {
+      activeCampaigns: {
+        value: currentMetrics.activeCampaigns,
+        change: calculateChange(currentMetrics.activeCampaigns, previousMetrics.activeCampaigns),
+      },
+      ongoingCalls: {
+        value: currentMetrics.ongoingCalls,
+        change: 0, // No se calcula tendencia para un valor en tiempo real
+      },
+      successRate: {
+        value: currentMetrics.successRate,
+        // La diferencia de tasas de éxito se calcula como puntos porcentuales
+        change: (currentMetrics.successRate - previousMetrics.successRate) * 100, 
+      },
+      channels: overviewData.channels,
+    };
+  
     return {
       ivr: ivrOverview,
       whatsapp: whatsappOverview,
     };
   }
+  
 
   /**
    * ✅ NUEVO: Analiza el rendimiento de los agentes y predice el mejor.

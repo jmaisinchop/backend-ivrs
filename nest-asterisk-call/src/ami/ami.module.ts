@@ -3,13 +3,12 @@ import { HttpModule } from '@nestjs/axios';
 import { AmiService } from './ami.service';
 import { AmiController } from './ami.controller';
 import { CampaignModule } from '../campaign/campaign.module';
-
+import { DashboardModule } from '../dashboard/dashboard.module';
 @Module({
   imports: [
     HttpModule,
-    // Necesitamos el CampaignModule por la referencia cruzada (CampaignService),
-    // uso forwardRef para evitar problemas circulares
     forwardRef(() => CampaignModule),
+    DashboardModule,
   ],
   controllers: [AmiController],
   providers: [AmiService],

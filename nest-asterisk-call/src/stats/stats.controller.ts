@@ -20,6 +20,31 @@ export class StatsController {
     return this.stats.getDashboardOverview(userId);
   }
 
+  // --- 👇 NUEVOS ENDPOINTS PARA GRÁFICOS 👇 ---
+
+  /**
+   * ✅ NUEVO: Devuelve la distribución de estados de llamadas IVRS para el gráfico.
+   */
+  @Get('ivr-status-distribution')
+  getIvrStatusDistribution(@Req() req) {
+    const userId = this._uid(req);
+    // Usamos el método existente que ya obtiene estos datos.
+    return this.stats.getCallStatusDistribution(30, userId);
+  }
+
+  /**
+   * ✅ NUEVO: Devuelve las estadísticas de WhatsApp para el gráfico.
+   */
+  @Get('whatsapp-stats')
+  getWhatsappStats(@Req() req) {
+    const userId = this._uid(req);
+    // Usamos el método existente que ya obtiene estos datos.
+    return this.stats.getWhatsappStats(userId);
+  }
+
+  // --- FIN DE NUEVOS ENDPOINTS ---
+
+
   /* ---------- OVERVIEW ---------- */
   @Get('overview')
   overview(@Req() req) {
