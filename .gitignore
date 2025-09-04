@@ -3,4 +3,4 @@
 /whatsapp-service/whatsapp-sessions
 /nest-asterisk-call/dist
 /nest-asterisk-call/node_modules
-/tts-service
+/tts-service/piper_models
