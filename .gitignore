@@ -1,0 +1,6 @@
+/whatsapp-service/dist
+/whatsapp-service/node_modules
+/whatsapp-service/whatsapp-sessions
+/nest-asterisk-call/dist
+/nest-asterisk-call/node_modules
+/tts-service
