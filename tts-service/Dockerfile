@@ -1,14 +1,13 @@
-    FROM python:3.9-slim
+FROM python:3.9-slim
 
-    WORKDIR /app
+WORKDIR /app
 
-    # Instala ffmpeg y los datos de zona horaria
-    RUN apt-get update && \
-        apt-get install -y ffmpeg tzdata && \
-        rm -rf /var/lib/apt/lists/*
+# Instala ffmpeg, datos de zona horaria Y AHORA CURL
+RUN apt-get update && \
+    apt-get install -y ffmpeg tzdata curl && \
+    rm -rf /var/lib/apt/lists/*
 
-    COPY requirements_tts.txt .
-    RUN pip install --no-cache-dir -r requirements_tts.txt
+COPY requirements_tts.txt .
+RUN pip install --no-cache-dir -r requirements_tts.txt
 
-    COPY . .
-    
+COPY . .

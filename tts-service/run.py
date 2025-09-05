@@ -55,7 +55,10 @@ def enqueue_tts_task():
 
     except Exception as e:
         return jsonify({"error": f"No se pudo conectar o encolar la tarea en Redis: {e}"}), 500
-
+@app.route('/health')
+def health_check():
+    """Simple health check endpoint."""
+    return jsonify({"status": "ok"}), 200
 
 # La siguiente secci??n es solo para pruebas locales sin Docker/Gunicorn.
 if __name__ == '__main__':

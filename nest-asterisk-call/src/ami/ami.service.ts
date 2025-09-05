@@ -71,7 +71,7 @@ export class AmiService implements OnModuleInit {
         this.logger.error('WebSocket ARI cerrado, reintentando...');
         setTimeout(() => this.connectAri(), WS_RETRY_MS);
       });
-      await this.ari.start('stasis-app-test');
+      await this.ari.start('stasis-app');
       this.logger.log('Conectado a ARI');
     } catch (err: any) {
       this.logger.error(`Error conectando a ARI: ${err.message}`);
@@ -197,7 +197,7 @@ export class AmiService implements OnModuleInit {
       // attemptStartedAt ya se estableció y pasó como parámetro
       this.ari.channels.originate({
         endpoint: `SIP/${trunk}/${phone}`,
-        app: 'stasis-app-test',
+        app: 'stasis-app',
         callerId: `IVR-${callId}`,
         timeout: 45,
         channelId: callId,

@@ -22,7 +22,7 @@ export class AppController {
         'ERROR FATAL: Las variables INTERNAL_API_SECRET y/o MONOLITH_API_URL no están definidas en el archivo .env del whatsapp-service.',
       );
     }
-    
+
     this.internalApiSecret = secret;
     this.monolithApiUrl = apiUrl;
   }
@@ -53,18 +53,22 @@ export class AppController {
 
     try {
       await this.whatsappService.sendMessage(data.userId, data.to, data.text);
-      
-      this.httpService.post(updateStatusUrl, 
-        { status: 'SENT' }, 
+
+      this.httpService.post(updateStatusUrl,
+        { status: 'SENT' },
         requestConfig
       ).subscribe();
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      this.httpService.post(updateStatusUrl, 
+      this.httpService.post(updateStatusUrl,
         { status: 'FAILED', errorMessage: errorMessage },
         requestConfig
       ).subscribe();
     }
+  }
+  @MessagePattern('health') 
+  handleHealthCheck() {
+    return { status: 'ok' };
   }
 }
