@@ -41,19 +41,22 @@ export class Contact {
   @Column({ type: 'bigint' })
   @Generated('increment')
   sequence: number;
+  
+  @Column({ type: 'varchar', length: 100, nullable: true }) 
+  activeChannelId: string | null;
 
   @ManyToOne(() => Campaign, (campaign) => campaign.contacts, {
     onDelete: 'CASCADE',
   })
   campaign: Campaign;
 
-// Nuevos Timestamps
-@Column({ type: 'timestamp', nullable: true, comment: 'Timestamp when the call process started for this contact' })
-startedAt: Date | null;
+  // Nuevos Timestamps
+  @Column({ type: 'timestamp', nullable: true, comment: 'Timestamp when the call process started for this contact' })
+  startedAt: Date | null;
 
-@Column({ type: 'timestamp', nullable: true, comment: 'Timestamp when the call was answered' })
-answeredAt: Date | null;
+  @Column({ type: 'timestamp', nullable: true, comment: 'Timestamp when the call was answered' })
+  answeredAt: Date | null;
 
-@Column({ type: 'timestamp', nullable: true, comment: 'Timestamp when the call process finished for this contact' })
-finishedAt: Date | null;
+  @Column({ type: 'timestamp', nullable: true, comment: 'Timestamp when the call process finished for this contact' })
+  finishedAt: Date | null;
 }

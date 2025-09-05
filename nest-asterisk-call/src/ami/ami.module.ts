@@ -1,17 +1,18 @@
 import { Module, forwardRef } from '@nestjs/common';
-import { HttpModule } from '@nestjs/axios';
 import { AmiService } from './ami.service';
+import { HttpModule } from '@nestjs/axios';
+import { CampaignModule } from 'src/campaign/campaign.module';
+import { DashboardModule } from 'src/dashboard/dashboard.module';
 import { AmiController } from './ami.controller';
-import { CampaignModule } from '../campaign/campaign.module';
-import { DashboardModule } from '../dashboard/dashboard.module';
+
 @Module({
   imports: [
     HttpModule,
     forwardRef(() => CampaignModule),
-    DashboardModule,
+    DashboardModule
   ],
-  controllers: [AmiController],
   providers: [AmiService],
   exports: [AmiService],
+  controllers: [AmiController], 
 })
 export class AmiModule {}
