@@ -1,9 +1,6 @@
-# worker.py
-
 import os
 import uuid
-import time
-import traceback
+import logging
 from io import BytesIO
 import wave
 
@@ -12,7 +9,10 @@ from piper.voice import PiperVoice
 from pydub import AudioSegment
 import paramiko
 from redis import Redis
-from rq import Queue, Worker
+from rq import Worker
+
+# --- Configuración de Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- 1. Configuración ---
 MODEL_PATH = "piper_models/es_MX-claude-high.onnx"
@@ -24,90 +24,78 @@ SFTP_PASS = '123456789a'
 REMOTE_PATH = '/var/lib/asterisk/sounds/campanas'
 
 # --- 2. Inicialización de servicios ---
-print("🚀 Inicializando worker...")
+logging.info("🚀 Inicializando worker...")
 
-# Cargar el modelo de voz una sola vez al iniciar el worker
 try:
-    print(f"Cargando modelo Piper desde: {MODEL_PATH}")
+    logging.info(f"Cargando modelo Piper desde: {MODEL_PATH}")
     voice = PiperVoice.load(MODEL_PATH, config_path=CONFIG_PATH)
-    print("✅ Modelo Piper cargado con éxito.")
+    logging.info("✅ Modelo Piper cargado con éxito.")
 except Exception as e:
-    print(f"❌ Error fatal: No se pudo cargar el modelo Piper. {e}")
+    logging.error(f"❌ Error fatal: No se pudo cargar el modelo Piper. {e}")
     exit()
 
-# Conectar a Redis usando el nombre del servicio de Docker Compose
 redis_conn = Redis(host='redis', port=6379, db=0)
 
+# --- 3. Conexión SFTP Robusta y Persistente (LA MEJORA DE VELOCIDAD) ---
+sftp_transport = None
+sftp_client = None
 
-def process_tts(text):
-    """
-    Genera un audio .gsm 8kHz mono usando Piper y pydub
-    y lo sube por SFTP.
-    """
-    transport = None
-    sftp_client = None
+def get_sftp_connection():
+    global sftp_transport, sftp_client
+    if sftp_transport and sftp_transport.is_active():
+        return sftp_client # Reutiliza la conexión si está activa
 
+    logging.warning("🔌 No hay conexión SFTP activa. Creando una nueva...")
     try:
-        # Conectar a SFTP por cada trabajo para evitar timeouts
-        print(f"Conectando a SFTP en {SFTP_HOST}...")
-        transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
-        transport.connect(username=SFTP_USER, password=SFTP_PASS)
-        sftp_client = paramiko.SFTPClient.from_transport(transport)
-
+        sftp_transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+        sftp_transport.connect(username=SFTP_USER, password=SFTP_PASS)
+        sftp_client = paramiko.SFTPClient.from_transport(sftp_transport)
         try:
             sftp_client.chdir(REMOTE_PATH)
         except IOError:
-            print(f"Directorio remoto no encontrado, creando '{REMOTE_PATH}'...")
             sftp_client.mkdir(REMOTE_PATH)
             sftp_client.chdir(REMOTE_PATH)
-        print(f"✅ Conexión SFTP establecida. Directorio actual: {REMOTE_PATH}")
+        logging.info(f"✅ Conexión SFTP establecida.")
+        return sftp_client
+    except Exception as e:
+        logging.error(f"❌ Error fatal al conectar a SFTP: {e}")
+        sftp_transport = sftp_client = None
+        raise ConnectionError(f"No se pudo conectar a SFTP: {e}")
 
-        print(f"🎙️ Generando audio para el texto: '{text[:30]}...'")
+# --- 4. Función de Procesamiento del Worker ---
+def process_tts(text):
+    sftp = get_sftp_connection() # Obtiene la conexión optimizada
+    logging.info(f"🎙️ Generando audio para: '{text[:40]}...'")
 
-        # 1. Generar audio WAV en memoria con Piper
-        audio_generator = voice.synthesize(text)
-        pcm_audio_bytes = b"".join(chunk.audio_int16_bytes for chunk in audio_generator)
+    # 1. Generar audio WAV en memoria con Piper
+    audio_generator = voice.synthesize(text)
+    pcm_audio_bytes = b"".join(chunk.audio_int16_bytes for chunk in audio_generator)
+    wav_buffer = BytesIO()
+    with wave.open(wav_buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(voice.config.sample_rate)
+        wav_file.writeframes(pcm_audio_bytes)
+    wav_buffer.seek(0)
 
-        wav_buffer = BytesIO()
-        with wave.open(wav_buffer, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(voice.config.sample_rate)
-            wav_file.writeframes(pcm_audio_bytes)
-        wav_buffer.seek(0)
+    # 2. Convertir el WAV a formato GSM con pydub
+    audio = AudioSegment.from_wav(wav_buffer)
+    audio = audio.set_frame_rate(8000).set_channels(1)
+    gsm_buffer = BytesIO()
+    audio.export(gsm_buffer, format='gsm')
+    gsm_buffer.seek(0)
 
-        # 2. Convertir el WAV a formato GSM con pydub
-        print("Convirtiendo a GSM 8kHz mono con pydub...")
-        audio = AudioSegment.from_wav(wav_buffer)
-        audio = audio.set_frame_rate(8000).set_channels(1)
+    # 3. Subir el archivo .gsm por SFTP
+    filename = f"{uuid.uuid4().hex}.gsm"
+    logging.info(f"📤 Subiendo '{filename}'...")
+    sftp.putfo(gsm_buffer, filename)
+    logging.info("✅ Archivo subido con éxito.")
 
-        gsm_buffer = BytesIO()
-        audio.export(gsm_buffer, format='gsm')
-        gsm_buffer.seek(0)
+    return {"filename": filename, "saved_to": f"{SFTP_HOST}:{REMOTE_PATH}/{filename}"}
 
-        # 3. Subir el archivo .gsm por SFTP desde memoria
-        filename = f"{uuid.uuid4().hex}.gsm"
-        print(f"📤 Subiendo '{filename}' a {SFTP_HOST}...")
-        sftp_client.putfo(gsm_buffer, filename)
-        print("✅ Archivo subido con éxito.")
-
-        return {"filename": filename, "saved_to": f"{SFTP_HOST}:{REMOTE_PATH}/{filename}"}
-
-    finally:
-        # Asegurarse de cerrar siempre la conexión SFTP
-        if sftp_client:
-            sftp_client.close()
-            print("SFTP client closed.")
-        if transport:
-            transport.close()
-            print("SFTP transport closed.")
-
-
-# --- 3. Bucle principal para procesar trabajos ---
+# --- 5. Bucle Principal del Worker ---
 if __name__ == '__main__':
     listen = ['tts']
-    print(f"\n🎧 Worker listo y escuchando la cola: {listen}...")
-    # Crea una instancia de Worker y le dice que empiece a trabajar.
-    # Esto maneja el bucle de escucha de forma más robusta que un `while True`.
+    logging.info(f"\n🎧 Worker listo y escuchando la cola: {listen}...")
     w = Worker(listen, connection=redis_conn)
     w.work()
