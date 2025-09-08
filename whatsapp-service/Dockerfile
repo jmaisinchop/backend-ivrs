@@ -1,26 +1,25 @@
-    # --- Etapa 1: Build ---
-    FROM node:20-alpine AS build
-    # Instala git y datos de zona horaria
-    RUN apk add --no-cache git tzdata
+# --- Etapa 1: Build ---
+FROM node:20-alpine AS build
 
-    WORKDIR /app
-    COPY package*.json ./
-    RUN npm install --legacy-peer-deps
-    COPY . .
-    RUN npm run build
+# ✅ AÑADIR: Instala tzdata Y TAMBIÉN git
+RUN apk add --no-cache tzdata git
 
-    # --- Etapa 2: Producción ---
-    FROM node:20-alpine
-    # Instala datos de zona horaria en la imagen final
-    RUN apk add --no-cache tzdata
+ENV TZ="America/Guayaquil"
+WORKDIR /app
+COPY package*.json ./
+# Ahora este comando funcionará porque 'git' ya existe
+RUN npm install --legacy-peer-deps
+COPY . .
+RUN npm run build
 
-    WORKDIR /app
-    COPY --from=build /app/dist ./dist
-    COPY --from=build /app/package*.json ./
-    RUN npm install --production --legacy-peer-deps
-
-    # Para nest-api usa 3000, para whatsapp-service usa 3001
-    EXPOSE 3001
-
-    CMD ["node", "dist/main"]
-    
+# --- Etapa 2: Producción ---
+# No se necesita git aquí, así que la imagen final se mantiene ligera
+FROM node:20-alpine
+RUN apk add --no-cache tzdata
+ENV TZ="America/Guayaquil"
+WORKDIR /app
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/package*.json ./
+RUN npm install --production --legacy-peer-deps
+EXPOSE 3001
+CMD ["node", "dist/main"]
