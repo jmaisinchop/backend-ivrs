@@ -5,13 +5,17 @@ import { UpdateCampaignDto } from './dto/update-campaign.dto';
 import { DuplicateCampaignDto } from './dto/duplicate-campaign.dto';
 import { CreateCampaignDto } from './dto/create-campaign.dto';
 import { PermissionGuard, RequirePermission } from '../auth/permissions.guard';
+import { Roles } from 'src/auth/roles.decorator';
+import { RolesGuard } from 'src/auth/roles.guard';
+import { AmiService } from '../ami/ami.service'; // <-- Importa AmiService
 
 
 @UseGuards(AuthGuard('jwt'), PermissionGuard) // 👈 aplica a todo el controlador
 @RequirePermission('ivrs')
 @Controller('campaigns')
 export class CampaignController {
-  constructor(private readonly campaignService: CampaignService) { }
+  constructor(private readonly campaignService: CampaignService, private readonly amiService: AmiService,
+  ) { }
 
   @Post()
   @Post()
@@ -160,4 +164,15 @@ export class CampaignController {
     return this.campaignService.updateCampaign(campaignId, updateDto);
   }
 
+  @Post('contacts/:contactId/spy')
+  async spyOnCall(
+    @Param('contactId') contactId: string,
+    @Req() req,
+  ) {
+    const supervisorExtension = req.user.extension;
+    if (!supervisorExtension) {
+      throw new Error('El perfil del supervisor no tiene una extensión configurada.');
+    }
+    return this.amiService.spyCall(contactId, supervisorExtension);
+  }
 }

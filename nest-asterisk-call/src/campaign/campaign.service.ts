@@ -542,6 +542,8 @@ export class CampaignService {
     startedAt?: Date | null,
     answeredAt?: Date | null,
     finishedAt?: Date | null,
+    clearChannelId: boolean = false,
+
   ): Promise<void> {
     this.dashboardGateway.sendUpdate({ event: 'call-finished' });
     const contact = await this.contactRepo.findOne({ where: { id: contactId }, relations: ['campaign'] });
@@ -583,6 +585,9 @@ export class CampaignService {
     contact.startedAt = startedAt ?? null;
     contact.answeredAt = answeredAt ?? null;
     contact.finishedAt = finishedAt ?? null;
+    if (clearChannelId) {
+      contact.activeChannelId = null;
+    }
     await this.contactRepo.save(contact);
 
     this.logger.log(
@@ -843,5 +848,12 @@ export class CampaignService {
       [campaignId],
     );
     return Math.max(1, Math.ceil(+count / limit));
+  }
+  async findContactById(contactId: string): Promise<Contact | null> {
+    return this.contactRepo.findOne({ where: { id: contactId } });
+  }
+
+  async updateContactChannelId(contactId: string, channelId: string): Promise<void> {
+    await this.contactRepo.update({ id: contactId }, { activeChannelId: channelId });
   }
 }

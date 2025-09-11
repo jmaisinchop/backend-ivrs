@@ -21,8 +21,12 @@ export class UpdateUserDto {
   @IsBoolean()
   @IsOptional()
   canAccessIvrs?: boolean;
-  
+
   @IsBoolean()
   @IsOptional()
   canAccessWhatsapp?: boolean;
+  
+  @IsString()
+  @IsOptional()
+  extension?: string;
 }

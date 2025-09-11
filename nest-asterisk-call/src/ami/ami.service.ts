@@ -1,4 +1,3 @@
-
 import {
   Injectable,
   OnModuleInit,
@@ -10,21 +9,21 @@ import { HttpService } from '@nestjs/axios';
 import { lastValueFrom } from 'rxjs';
 import FormData from 'form-data';
 import { v4 as uuidv4 } from 'uuid';
-const AriClient = require('ari-client');
+import AriClient from 'ari-client';
 import { CampaignService } from '../campaign/campaign.service';
 import { ConfigService } from '@nestjs/config';
 import { DashboardGateway } from 'src/dashboard/dashboard.gateway';
+import { EventEmitter } from 'events';
 
 const WS_RETRY_MS = 3000;
-const ORIGINATE_TIMEOUT_MS = 70000; // Sigue siendo el máximo absoluto
+const ORIGINATE_TIMEOUT_MS = 70000;
 
-
-const CAUSES: Record<number | string, string> = { // Permitir string para -99 si lo usamos
+const CAUSES: Record<number | string, string> = {
   1: 'Número no asignado',
   16: 'Finalización normal',
   17: 'Ocupado',
   18: 'Sin respuesta',
-  19: 'No contestó', // A menudo, este es el resultado de un timeout de ringing sin respuesta explícita
+  19: 'No contestó',
   21: 'Rechazado',
   28: 'Número inválido',
   31: 'Fallo general',
@@ -32,7 +31,6 @@ const CAUSES: Record<number | string, string> = { // Permitir string para -99 si
 };
 
 interface CallFlags { contactId: string; rang: boolean; up: boolean; }
-// Modificado para incluir timestamps
 interface CallResult {
   success: boolean;
   causeNum: string;
@@ -46,9 +44,9 @@ interface CallResult {
 export class AmiService implements OnModuleInit {
   private readonly logger = new Logger('AmiService');
   private ari: any;
-
   private readonly trunks = ['gsmDinstar', 'gsmDinstar2', 'gsmDinstar3', 'gsmDinstar5'];
   private flags = new Map<string, CallFlags>();
+  private readonly ariEvents = new EventEmitter();
 
   constructor(
     private readonly http: HttpService,
@@ -67,10 +65,16 @@ export class AmiService implements OnModuleInit {
         this.configService.get<string>('ARI_USERNAME'),
         this.configService.get<string>('ARI_PASSWORD'),
       );
+      
       this.ari.on('WebSocketClose', () => {
         this.logger.error('WebSocket ARI cerrado, reintentando...');
         setTimeout(() => this.connectAri(), WS_RETRY_MS);
       });
+
+      this.ari.on('StasisStart', (event: any, channel: any) => {
+        this.handleStasisStart(event, channel);
+      });
+
       await this.ari.start('stasis-app');
       this.logger.log('Conectado a ARI');
     } catch (err: any) {
@@ -79,84 +83,193 @@ export class AmiService implements OnModuleInit {
     }
   }
 
+  private async handleStasisStart(event: any, channel: any) {
+    this.logger.log(`[StasisStart] Canal ${channel.id} entró en la aplicación.`);
+    
+    const varResult = await channel.getChannelVar({ variable: 'SPY_LEG' }).catch(() => ({value: null}));
+    const isSpyLeg = varResult.value === 'true';
+    
+    if (isSpyLeg) {
+      this.logger.log(`[StasisStart] El canal ${channel.id} es una llamada para el supervisor. Contestando...`);
+      try {
+        await channel.answer();
+        this.logger.log(`[StasisStart] Canal ${channel.id} contestado.`);
+        
+        const masterIdResult = await channel.getChannelVar({ variable: 'SPY_MASTER_ID' });
+        const spyMasterId = masterIdResult.value;
+
+        if (spyMasterId) {
+            this.logger.log(`[StasisStart] Emitting 'supervisor_answered' para ${spyMasterId}`);
+            this.ariEvents.emit(`supervisor_answered_${spyMasterId}`, { supervisorChannel: channel });
+        } else {
+            this.logger.error(`[StasisStart] No se encontró SPY_MASTER_ID en el canal ${channel.id}`);
+        }
+      } catch (err: any) {
+        this.logger.error(`[StasisStart] Error al contestar el canal del supervisor ${channel.id}: ${err.message}`);
+        const masterIdResult = await channel.getChannelVar({ variable: 'SPY_MASTER_ID' }).catch(() => ({value: null}));
+        if(masterIdResult.value) {
+            this.ariEvents.emit(`supervisor_failed_${masterIdResult.value}`, new Error('No se pudo contestar la llamada del supervisor.'));
+        }
+      }
+    }
+    // Lógica para llamadas de campaña (reproducción de audio)
+    else if (channel.name.startsWith('SIP/')) { 
+        const f = this.flags.get(channel.id);
+        if (f && f.up) {
+            const contact = await this.campaigns.findContactById(f.contactId);
+            if(contact && contact.message) {
+                const audio = await this.generateTts(contact.message).catch(() => null);
+                if (audio) {
+                    this.logger.log(`[StasisStart] Reproduciendo audio ${audio} en canal de campaña ${channel.id}`);
+                    channel.play({ media: `sound:campanas/${audio}` }, (err: any, playback: any) => {
+                        if (err) {
+                            this.logger.error(`[StasisStart-Playback] Error: ${err.message}`);
+                            channel.hangup().catch(() => {});
+                            return;
+                        }
+                        playback.once('PlaybackFinished', () => {
+                            this.logger.log(`[StasisStart-Playback] Finalizado. Colgando.`);
+                            channel.hangup().catch(() => {});
+                        });
+                    });
+                }
+            }
+        }
+    }
+  }
+  
+  public async spyCall(contactId: string, supervisorExtension: string): Promise<{ message: string }> {
+    const callId = uuidv4();
+    this.logger.log(`[SPY:${callId}] Solicitud de espionaje para contacto ${contactId} por ${supervisorExtension}`);
+
+    const contact = await this.campaigns.findContactById(contactId);
+    if (!contact || !contact.activeChannelId) {
+      throw new Error('La llamada del contacto no está activa o no se encontró.');
+    }
+    const channelToSpyId = contact.activeChannelId;
+    this.logger.log(`[SPY:${callId}] Canal a espiar: ${channelToSpyId}`);
+
+    return new Promise(async (resolve, reject) => {
+        const cleanup = () => {
+            this.ariEvents.removeAllListeners(`supervisor_answered_${callId}`);
+            this.ariEvents.removeAllListeners(`supervisor_failed_${callId}`);
+        };
+
+        this.ariEvents.once(`supervisor_answered_${callId}`, async ({ supervisorChannel }) => {
+            cleanup();
+            this.logger.log(`[SPY:${callId}] Evento 'supervisor_answered' recibido para canal ${supervisorChannel.id}.`);
+            try {
+                // --- CORRECCIÓN FINAL ---
+                // Cambiamos 'in' por 'both' para escuchar ambas direcciones del audio.
+                const snoopChannel = await this.ari.channels.snoopChannel({
+                    channelId: channelToSpyId, app: 'stasis-app', spy: 'both',
+                });
+                // --- FIN DE LA CORRECCIÓN ---
+
+                this.logger.log(`[SPY:${callId}] Canal de espionaje creado: ${snoopChannel.id}`);
+
+                const bridge = this.ari.Bridge();
+                await bridge.create({ type: 'mixing' });
+                this.logger.log(`[SPY:${callId}] Puente creado: ${bridge.id}`);
+
+                await bridge.addChannel({ channel: [supervisorChannel.id, snoopChannel.id] });
+                this.logger.log(`[SPY:${callId}] Canales añadidos al puente. Espionaje activo.`);
+
+                supervisorChannel.once('StasisEnd', () => {
+                    this.logger.log(`[SPY:${callId}] El supervisor colgó. Limpiando.`);
+                    snoopChannel.hangup().catch(() => {});
+                    bridge.destroy().catch(() => {});
+                });
+                
+                resolve({ message: 'Conectado a la llamada.' });
+            } catch (err: any) {
+                this.logger.error(`[SPY:${callId}] Error al crear snoop/bridge: ${err.message}`);
+                supervisorChannel.hangup().catch(() => {});
+                reject(new Error('Error al conectar los canales de espionaje.'));
+            }
+        });
+
+        this.ariEvents.once(`supervisor_failed_${callId}`, (err: Error) => {
+            cleanup();
+            this.logger.error(`[SPY:${callId}] Evento 'supervisor_failed' recibido: ${err.message}`);
+            reject(err);
+        });
+
+        try {
+            this.logger.log(`[SPY:${callId}] Originando llamada a extensión interna ${supervisorExtension}`);
+            await this.ari.channels.originate({
+                endpoint: `Local/${supervisorExtension}@from-internal`,
+                callerId: 'Supervisor',
+                app: 'stasis-app',
+                variables: {
+                    'SPY_LEG': 'true',
+                    'SPY_MASTER_ID': callId,
+                },
+            });
+        } catch (err: any) {
+            this.ariEvents.emit(`supervisor_failed_${callId}`, err);
+        }
+    });
+  }
+
   public async callWithTTS(text: string, phone: string, contactId: string): Promise<void> {
     this.logger.log(`[${contactId}] Inicio callWithTTS ${phone}`);
-    const initialCallAttemptStartedAt = new Date(); // Momento en que se intenta la llamada inicialmente
-    // Persiste CALLING con la hora de inicio del intento de llamada general
+    const initialCallAttemptStartedAt = new Date();
     this.dashboardGateway.sendUpdate({ event: 'call-initiated' });
     await this.persist(contactId, 'CALLING', '', 'Calling', initialCallAttemptStartedAt, null, null).catch(() => { });
 
     const audio = await this.generateTts(text).catch(() => null);
     if (!audio) {
       this.dashboardGateway.sendUpdate({ event: 'call-finished' });
-      // Si falla TTS, persistimos con la hora de inicio del intento y la hora actual como finalización
       await this.persist(contactId, 'FAILED', '', 'TTS ERROR', initialCallAttemptStartedAt, null, new Date()).catch(() => { });
       return;
     }
     this.logger.log(`[${contactId}] Audio listo (${audio})`);
 
     let final: CallResult = {
-      success: false,
-      causeNum: '',
-      causeMsg: 'No trunks attempted',
-      startedAt: initialCallAttemptStartedAt, // Usar la hora de inicio del intento general
-      answeredAt: null,
-      finishedAt: new Date() // Por defecto, si no se intenta ninguna troncal
+      success: false, causeNum: '', causeMsg: 'No trunks attempted',
+      startedAt: initialCallAttemptStartedAt, answeredAt: null, finishedAt: new Date()
     };
 
     for (const trunk of this.trunks) {
       this.logger.log(`[${contactId}] Probando troncal ${trunk} con audio ${audio}`);
-      let attemptSpecificStartedAt = new Date(); // Hora de inicio para ESTE intento de troncal
+      let attemptSpecificStartedAt = new Date();
       try {
-        // tryCallRaw ahora devolverá los timestamps específicos de ese intento
         final = await this.tryCallRaw(contactId, trunk, phone, audio, attemptSpecificStartedAt);
       } catch (e: any) {
         this.logger.error(`[${contactId}] Error catastrófico en tryCallRaw con troncal ${trunk}: ${e.message}`);
         final = {
-          success: false,
-          causeNum: 'ERROR_INTERNO',
-          causeMsg: 'Error originando llamada',
-          startedAt: attemptSpecificStartedAt, // Hora de inicio de este intento fallido específico
-          answeredAt: null,
-          finishedAt: new Date() // Hora de fin de este intento fallido específico
+          success: false, causeNum: 'ERROR_INTERNO', causeMsg: 'Error originando llamada',
+          startedAt: attemptSpecificStartedAt, answeredAt: null, finishedAt: new Date()
         };
       }
-      // Si la llamada fue exitosa, contestada (incluso si ocupado), o si se completó normalmente, salimos del bucle.
       if (final.success || final.causeNum === '16' || final.causeNum === '17') {
         break;
       }
     }
 
-    // Usar el initialCallAttemptStartedAt para el startedAt final que se persiste,
-    // a menos que el 'final.startedAt' (del último tryCallRaw) sea más relevante y exista.
-    // En general, el 'initialCallAttemptStartedAt' marca el inicio del proceso de 'callWithTTS'.
-    // Los 'final.answeredAt' y 'final.finishedAt' vienen del intento de troncal más relevante.
     await this.persist(
-      contactId,
-      final.success ? 'SUCCESS' : 'FAILED',
-      final.causeNum,
-      final.causeMsg,
-      initialCallAttemptStartedAt, // Hora de inicio del proceso general de callWithTTS
-      final.answeredAt,           // Hora de contestación del intento exitoso (o último intento)
-      final.finishedAt,           // Hora de finalización del intento exitoso (o último intento)
+      contactId, final.success ? 'SUCCESS' : 'FAILED', final.causeNum, final.causeMsg,
+      initialCallAttemptStartedAt, final.answeredAt, final.finishedAt,
     ).catch(() => { });
     this.logger.log(`[${contactId}] Resultado final → ${final.causeMsg}`);
   }
 
   private async tryCallRaw(
     contactId: string, trunk: string, phone: string, audio: string,
-    attemptStartedAt: Date // Recibe la hora de inicio del intento de esta troncal
+    attemptStartedAt: Date
   ): Promise<CallResult> {
     const callId = uuidv4();
     this.flags.set(callId, { contactId, rang: false, up: false });
     this.logger.log(`[${callId}] Originando ${phone} via ${trunk} (Attempt started: ${attemptStartedAt.toISOString()})`);
-
+    
+    if (contactId) {
+      await this.campaigns.updateContactChannelId(contactId, callId);
+    }
+    
     let ariChannel: any = null;
     let eventCauseCode = -1;
     let eventChannelDestroyed = false;
-
-    // Timestamps para este intento de llamada específico
-    // attemptStartedAt ya se recibe como parámetro
     let attemptAnsweredAt: Date | null = null;
     let attemptFinishedAt: Date | null = null;
 
@@ -166,12 +279,12 @@ export class AmiService implements OnModuleInit {
       const resolveOnce = (result: Omit<CallResult, 'startedAt' | 'answeredAt' | 'finishedAt'>) => {
         if (!isPromiseResolved) {
           isPromiseResolved = true;
-          if (!attemptFinishedAt) attemptFinishedAt = new Date(); // Marcar la hora de finalización si no se hizo antes
+          if (!attemptFinishedAt) attemptFinishedAt = new Date();
           if (mainTimeoutId) clearTimeout(mainTimeoutId);
           this.flags.delete(callId);
           resolve({
             ...result,
-            startedAt: attemptStartedAt, // Este es el attemptStartedAt de este intento de troncal
+            startedAt: attemptStartedAt,
             answeredAt: attemptAnsweredAt,
             finishedAt: attemptFinishedAt
           });
@@ -181,7 +294,7 @@ export class AmiService implements OnModuleInit {
       const mainTimeoutId = setTimeout(() => {
         if (isPromiseResolved) return;
         this.logger.warn(`[${callId}] Timeout principal (${ORIGINATE_TIMEOUT_MS}ms) alcanzado.`);
-        attemptFinishedAt = new Date(); // Timeout es una forma de finalización
+        attemptFinishedAt = new Date();
 
         if (ariChannel && !eventChannelDestroyed) {
           this.logger.warn(`[${callId}] Forzando hangup del canal por timeout principal.`);
@@ -194,7 +307,6 @@ export class AmiService implements OnModuleInit {
 
       }, ORIGINATE_TIMEOUT_MS);
 
-      // attemptStartedAt ya se estableció y pasó como parámetro
       this.ari.channels.originate({
         endpoint: `SIP/${trunk}/${phone}`,
         app: 'stasis-app',
@@ -208,7 +320,7 @@ export class AmiService implements OnModuleInit {
           ch.on('ChannelDestroyed', (ev: any) => {
             this.logger.log(`[${ch.id}] Evento: ChannelDestroyed, Causa: ${ev.cause}, Causa Num: ${ev.cause_code}`);
             eventChannelDestroyed = true;
-            attemptFinishedAt = new Date(); // ChannelDestroyed es una forma de finalización
+            attemptFinishedAt = new Date();
             eventCauseCode = ev.cause_code ?? ev.cause ?? -1;
             const currentFlags = this.flags.get(ch.id) || { contactId, rang: false, up: false };
             resolveOnce(this.interpret(eventCauseCode, currentFlags.up));
@@ -223,26 +335,16 @@ export class AmiService implements OnModuleInit {
               if (channelState.state === 'Up') {
                 if (f.up) return;
                 f.up = true;
-                if (!attemptAnsweredAt) attemptAnsweredAt = new Date(); // Marcar la hora de contestación
-                this.logger.log(`[${ch.id}] Llamada contestada (${attemptAnsweredAt.toISOString()}). Reproduciendo audio: ${audio}`);
-                ch.play({ media: `sound:campanas/${audio}` }, (err: any, playback: any) => {
-                  if (err) {
-                    this.logger.error(`[${ch.id}] Error al iniciar playback: ${err.message}`);
-                    ch.hangup().catch((hangupErr: any) => this.logger.error(`[${ch.id}] Error al colgar tras fallo de playback: ${hangupErr.message}`));
-                    return;
-                  }
-                  playback.once('PlaybackFinished', () => {
-                    this.logger.log(`[${ch.id}] Playback finalizado. Colgando.`);
-                    ch.hangup().catch((hangupErr: any) => this.logger.error(`[${ch.id}] Error al colgar tras PlaybackFinished: ${hangupErr.message}`));
-                  });
-                });
+                if (!attemptAnsweredAt) attemptAnsweredAt = new Date();
+                this.logger.log(`[${ch.id}] Llamada contestada (${attemptAnsweredAt.toISOString()}).`);
+                // La reproducción ahora se maneja en StasisStart
               }
             }
           });
         })
         .catch((err: any) => {
           this.logger.error(`[${callId}] Error al originar la llamada: ${err.message}`);
-          attemptFinishedAt = new Date(); // Falla al originar es una forma de finalización
+          attemptFinishedAt = new Date();
           resolveOnce({ success: false, causeNum: 'FAIL_ORIGINATE', causeMsg: `Error originando: ${err.message}` });
         });
     });
@@ -277,7 +379,7 @@ export class AmiService implements OnModuleInit {
     try {
       const { data } = await lastValueFrom(
         this.http.post<{ filename: string }>(
-          this.configService.get<string>('TTS_URL'), // Leer desde .env
+          this.configService.get<string>('TTS_URL'),
           form,
           { headers: form.getHeaders() },
         ),
@@ -300,7 +402,8 @@ export class AmiService implements OnModuleInit {
   ) {
     if (!id) return;
     try {
-      await this.campaigns.updateContactStatusById(id, status, num, msg, startedAt, answeredAt, finishedAt);
+      const shouldClearChannelId = status === 'SUCCESS' || status === 'FAILED';
+      await this.campaigns.updateContactStatusById(id, status, num, msg, startedAt, answeredAt, finishedAt, shouldClearChannelId);
     }
     catch (e: any) { this.logger.error(`Persist fail for contact ${id}: ${e.message}`); }
   }
@@ -310,14 +413,10 @@ export class AmiService implements OnModuleInit {
     s: string,
     n?: string,
     m?: string,
-    startedAt?: Date | null, // Estos vienen de CampaignService si llama a este método directamente
+    startedAt?: Date | null,
     answeredAt?: Date | null,
     finishedAt?: Date | null
   ) {
-    // Este método es expuesto y puede ser llamado por CampaignService.
-    // La lógica principal de timestamps se maneja en el `persist` interno
-    // cuando AmiService origina la llamada. Si CampaignService necesita
-    // actualizar timestamps por otra razón, este método lo permite.
     return this.campaigns.updateContactStatusById(id, s, n, m, startedAt, answeredAt, finishedAt);
   }
 }
