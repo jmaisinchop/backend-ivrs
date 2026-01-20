@@ -1,0 +1,11 @@
+nest-asterisk-call/.env.*
+nest-asterisk-call/dist
+nest-asterisk-call/node_modules
+
+
+tts-service/pipers_models
+
+
+whatsapp-service/node_modules
+whatsapp-service/dist
+whatsapp-service/.env.*

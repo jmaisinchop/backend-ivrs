@@ -1,0 +1,22 @@
+# Usa una imagen base de Node.js
+FROM node:20-slim
+
+# Instala git y curl
+RUN apt-get update && \
+    apt-get install -y git curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Establece el directorio de trabajo
+WORKDIR /app
+
+# Copia los archivos de dependencias
+COPY package*.json ./
+
+# Instala TODAS las dependencias
+RUN npm install --legacy-peer-deps
+
+# Copia el resto del código
+COPY . .
+EXPOSE 3001
+# Comando por defecto para el modo de desarrollo
+CMD ["npm", "run", "start:dev"]

@@ -1,0 +1,11 @@
+# requirements_tts.txt
+
+flask
+flask-cors
+redis
+rq
+paramiko
+pydub
+imageio-ffmpeg
+piper-tts
+gunicorn

@@ -1,0 +1,20 @@
+# Usa una imagen base de Node.js
+FROM node:20-alpine
+
+# Instala git (para dependencias de npm) y curl (para el healthcheck)
+RUN apk add --no-cache git curl
+
+# Establece el directorio de trabajo
+WORKDIR /app
+
+# Copia los archivos de dependencias
+COPY package*.json ./
+
+# Instala TODAS las dependencias
+RUN npm install --legacy-peer-deps
+
+# Copia el resto del código
+COPY . .
+EXPOSE 3000
+# Comando por defecto para el modo de desarrollo
+CMD ["npm", "run", "start:dev"]
