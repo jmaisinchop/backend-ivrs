@@ -1,4 +1,4 @@
-import { Injectable, forwardRef, Inject, BadRequestException, Logger, NotFoundException } from '@nestjs/common';
+import { Injectable, forwardRef, Inject, BadRequestException, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In, LessThan, EntityManager } from 'typeorm';
 import { Cron } from '@nestjs/schedule';
@@ -22,7 +22,7 @@ dayjs.extend(isBetween);
 dayjs.extend(isSameOrAfter);
 
 @Injectable()
-export class CampaignService {
+export class CampaignService implements OnModuleInit {
   private processingCampaigns = new Set<string>();
   private readonly logger = new Logger(CampaignService.name);
 
@@ -37,14 +37,24 @@ export class CampaignService {
     private readonly dashboardGateway: DashboardGateway,
   ) { }
 
-  /** Crea una nueva campaña, valida las fechas y la disponibilidad de canales concurrentes para el usuario.
-   * Reserva los canales y establece el estado inicial (SCHEDULED, PAUSED o COMPLETED).
+  /** * Limpieza de llamadas "zombis" al arrancar el servidor.
+   * Restablece contactos que se quedaron en CALLING por un reinicio abrupto.
    */
+  async onModuleInit() {
+    this.logger.log('Iniciando CampaignService. Buscando contactos zombis (CALLING)...');
+    const result = await this.contactRepo.update(
+      { callStatus: 'CALLING' },
+      { callStatus: 'NOT_CALLED', activeChannelId: null }
+    );
+    if (result.affected && result.affected > 0) {
+      this.logger.warn(`Se restablecieron ${result.affected} contactos zombis a estado NOT_CALLED.`);
+    }
+  }
+
   async createCampaign(
     userId: string,
     dto: CreateCampaignDto
   ): Promise<Campaign> {
-
     const {
       name,
       startDate: startDateStr,
@@ -102,9 +112,6 @@ export class CampaignService {
     return this.campaignRepo.save(campaign);
   }
 
-  /** Duplica una campaña existente (incluyendo sus contactos, reseteando el estado de las llamadas) dentro de una transacción.
-   * Valida la disponibilidad de canales para la nueva campaña y los reserva.
-   */
   async duplicateCampaign(
     originalCampaignId: string,
     userId: string,
@@ -171,10 +178,8 @@ export class CampaignService {
         });
       });
 
-      this.logger.log(`[DUPLICATE] Guardando ${newContacts.length} contactos uno por uno...`);
-      for (const contact of newContacts) {
-        await transactionalEntityManager.save(contact);
-      }
+      // Guardado por lotes para optimizar si son muchos contactos
+      await transactionalEntityManager.save(newContacts);
       this.logger.log(`[DUPLICATE] ${newContacts.length} contactos copiados y reseteados exitosamente.`);
 
       return savedCampaign;
@@ -259,9 +264,12 @@ export class CampaignService {
 
     camp.status = 'RUNNING';
     await this.campaignRepo.save(camp);
+    
+    // Disparador inicial
     this.processCampaign(camp.id).catch((error) => {
       this.logger.error(`Error al iniciar el procesamiento de la campaña ${camp.id} desde startCampaign: ${error.message}`, error.stack);
     });
+    
     return camp.status === 'PAUSED'
       ? `Campaña ${camp.id} reanudada (RUNNING)`
       : `Campaña ${camp.id} iniciada manualmente (RUNNING)`;
@@ -299,11 +307,6 @@ export class CampaignService {
     return `Campaña ${camp.name} => CANCELADA`;
   }
 
-  /** Método programado (cada minuto) para revisar campañas en estado SCHEDULED o RUNNING.
-   * Inicia campañas SCHEDULED que están dentro de su ventana de tiempo.
-   * Marca campañas como COMPLETED si han pasado su fecha de finalización.
-   * Llama a `processCampaign` para las campañas RUNNING.
-   */
   @Cron('0 * * * * *')
   async checkCampaigns(): Promise<void> {
     const now = dayjs();
@@ -314,7 +317,6 @@ export class CampaignService {
     });
 
     for (const camp of campaignsToCheck) {
-
       if (['COMPLETED', 'CANCELLED', 'PAUSED'].includes(camp.status) && camp.status !== 'RUNNING') {
         continue;
       }
@@ -334,9 +336,11 @@ export class CampaignService {
         this.logger.log(`Campaña ${camp.id} (${camp.name}) programada está dentro de la ventana. Cambiando a RUNNING.`);
         camp.status = 'RUNNING';
         await this.campaignRepo.save(camp);
+        this.processCampaign(camp.id); // Iniciar procesamiento
       }
 
       if (camp.status === 'RUNNING') {
+        // Aseguramos que se mantenga viva
         this.processCampaign(camp.id).catch((error) => {
           this.logger.error(`Error al procesar campaña ${camp.id} desde checkCampaigns: ${error.message}`, error.stack);
         });
@@ -344,17 +348,13 @@ export class CampaignService {
     }
   }
 
-  /** Mantiene el cupo de llamadas vivas de la campaña.
-   * Utiliza un semáforo interno (`processingCampaigns`) para evitar ejecuciones concurrentes para la misma campaña.
-   * 1. Calcula los slots libres disponibles.
-   * 2. Intenta llenar los slots libres con contactos en estado NOT_CALLED (nuevos contactos).
-   * 3. Si aún quedan slots libres, intenta llenarlos con contactos en estado FAILED (reintentos).
-   * 4. Verifica si la campaña ha terminado (todos los contactos SUCCESS o FAILED con reintentos agotados) y la marca como COMPLETED, liberando canales.
-   * Las selecciones de contactos para llamar se hacen dentro de una transacción con bloqueo pesimista (`pessimistic_write`) para evitar que múltiples ejecuciones del proceso elijan el mismo contacto.
-   */
+  // =================================================================================================
+  // LÓGICA CRÍTICA DE PROCESAMIENTO (OPTIMIZADA)
+  // =================================================================================================
+
   async processCampaign(campaignId: string): Promise<void> {
     if (this.processingCampaigns.has(campaignId)) {
-      this.logger.warn(`El procesamiento para la campaña ${campaignId} ya está en curso. Omitiendo esta ejecución.`);
+      // Evitar reentrancia local excesiva
       return;
     }
     this.processingCampaigns.add(campaignId);
@@ -363,23 +363,17 @@ export class CampaignService {
       const camp = await this.campaignRepo.findOne({ where: { id: campaignId } });
 
       if (!camp) {
-        this.logger.warn(`processCampaign: Campaña ${campaignId} no encontrada.`);
         this.processingCampaigns.delete(campaignId);
         return;
       }
 
       if (camp.status !== 'RUNNING') {
-        this.logger.log(`processCampaign: Campaña ${campaignId} no está en RUNNING (estado actual: ${camp.status}). Omitiendo.`);
         this.processingCampaigns.delete(campaignId);
         return;
       }
 
       const now = dayjs();
-      const startDate = dayjs(camp.startDate);
-      const endDate = dayjs(camp.endDate);
-
-      if (now.isBefore(startDate) || now.isAfter(endDate)) {
-        this.logger.log(`processCampaign: Campaña ${campaignId} fuera de su ventana de tiempo. Marcando como COMPLETED.`);
+      if (now.isAfter(dayjs(camp.endDate))) {
         camp.status = 'COMPLETED';
         await this.campaignRepo.save(camp);
         await this.channelLimitService.releaseChannels(camp.createdBy, camp.concurrentCalls);
@@ -387,99 +381,96 @@ export class CampaignService {
         return;
       }
 
+      // Contamos las llamadas activas (CALLING). 
+      // NOTA: AMI debe mantener el estado CALLING hasta que se reciba StasisEnd o Fallo.
       const activeCalls = await this.contactRepo.count({
         where: { campaign: { id: camp.id }, callStatus: 'CALLING' },
       });
-      let freeSlots = camp.concurrentCalls - activeCalls;
+      
+      const freeSlots = camp.concurrentCalls - activeCalls;
 
       if (freeSlots <= 0) {
-        this.logger.log(`processCampaign: Campaña ${campaignId} no tiene slots libres (activos: ${activeCalls}, concurrentes: ${camp.concurrentCalls}).`);
+        // Cupo lleno, no hacemos nada.
         this.processingCampaigns.delete(campaignId);
         return;
       }
-      this.logger.log(`processCampaign: Campaña ${campaignId} tiene ${freeSlots} slots libres (activos: ${activeCalls}, concurrentes: ${camp.concurrentCalls}).`);
 
-
+      // 1. Intentar llenar slots con contactos nuevos (NOT_CALLED)
+      let filledSlots = 0;
       if (freeSlots > 0) {
-        const notCalledContacts = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
+        const newContacts = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
           const items = await transactionalEntityManager
             .createQueryBuilder(Contact, 'c')
-            .setLock('pessimistic_write')
+            .setLock('pessimistic_write') // Bloqueo de fila para evitar condiciones de carrera entre nodos/procesos
             .where('c.campaignId = :campaignId', { campaignId: camp.id })
-            .andWhere('(c.callStatus IS NULL OR c.callStatus = :notCalledStatus)', { notCalledStatus: 'NOT_CALLED' })
+            .andWhere('c.callStatus = :status', { status: 'NOT_CALLED' })
             .andWhere('c.attemptCount < :maxRetries', { maxRetries: camp.maxRetries })
             .orderBy('c.sequence', 'ASC')
             .take(freeSlots)
             .getMany();
 
-          if (items.length > 0) {
-            this.logger.log(`processCampaign: ${items.length} contactos NOT_CALLED encontrados para campaña ${campaignId}.`);
-            for (const contact of items) {
-              contact.callStatus = 'CALLING';
-              contact.attemptCount = (contact.attemptCount || 0) + 1;
-              await transactionalEntityManager.save(contact);
-            }
+          for (const contact of items) {
+            contact.callStatus = 'CALLING';
+            contact.attemptCount = (contact.attemptCount || 0) + 1;
+            await transactionalEntityManager.save(contact);
           }
           return items;
         });
 
-        for (const contact of notCalledContacts) {
-          this.logger.log(`processCampaign: Iniciando llamada (NOT_CALLED) para contacto ${contact.id} (tel: ${contact.phone}) en campaña ${campaignId}.`);
+        for (const contact of newContacts) {
           this.amiService.callWithTTS(contact.message, contact.phone, contact.id)
-            .finally(() => {
-              this.processCampaign(campaignId).catch(e => this.logger.error(`Error en llamada recursiva (NOT_CALLED) a processCampaign para ${campaignId}: ${e.message}`, e.stack));
+            .catch(err => {
+               this.logger.error(`Error lanzando llamada a ${contact.id}: ${err.message}`);
+               // Si falla el lanzamiento, marcar como FAILED para no dejarlo pegado en CALLING
+               this.updateContactStatusById(contact.id, 'FAILED', 'ORIGINATE_ERROR', err.message);
             });
         }
-        const activeAfterNotCalled = await this.contactRepo.count({ where: { campaign: { id: camp.id }, callStatus: 'CALLING' } });
-        freeSlots = camp.concurrentCalls - activeAfterNotCalled;
+        filledSlots += newContacts.length;
       }
 
-
-      if (freeSlots > 0) {
-        const failedContactsToRetry = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
+      // 2. Intentar llenar slots restantes con reintentos (FAILED)
+      const remainingSlots = freeSlots - filledSlots;
+      if (remainingSlots > 0) {
+        const retryContacts = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
           const items = await transactionalEntityManager
             .createQueryBuilder(Contact, 'c')
             .setLock('pessimistic_write')
             .where('c.campaignId = :campaignId', { campaignId: camp.id })
-            .andWhere('c.callStatus = :failedStatus', { failedStatus: 'FAILED' })
+            .andWhere('c.callStatus = :status', { status: 'FAILED' })
             .andWhere('c.attemptCount < :maxRetries', { maxRetries: camp.maxRetries })
-            .orderBy('c.sequence', 'ASC')
-            .take(freeSlots)
+            .orderBy('c.sequence', 'ASC') // O por última fecha de intento
+            .take(remainingSlots)
             .getMany();
 
-          if (items.length > 0) {
-            this.logger.log(`processCampaign: ${items.length} contactos FAILED para reintentar encontrados para campaña ${campaignId}.`);
-            for (const contact of items) {
-              contact.callStatus = 'CALLING';
-              contact.attemptCount = (contact.attemptCount || 0) + 1;
-              await transactionalEntityManager.save(contact);
-            }
+          for (const contact of items) {
+            contact.callStatus = 'CALLING';
+            contact.attemptCount = (contact.attemptCount || 0) + 1;
+            await transactionalEntityManager.save(contact);
           }
           return items;
         });
 
-        for (const contact of failedContactsToRetry) {
-          this.logger.log(`processCampaign: Iniciando llamada (FAILED) para contacto ${contact.id} (tel: ${contact.phone}) en campaña ${campaignId}.`);
+        for (const contact of retryContacts) {
           this.amiService.callWithTTS(contact.message, contact.phone, contact.id)
-            .finally(() => {
-              this.processCampaign(campaignId).catch(e => this.logger.error(`Error en llamada recursiva (FAILED) a processCampaign para ${campaignId}: ${e.message}`, e.stack));
+            .catch(err => {
+                this.logger.error(`Error lanzando reintento a ${contact.id}: ${err.message}`);
+                this.updateContactStatusById(contact.id, 'FAILED', 'ORIGINATE_ERROR', err.message);
             });
         }
       }
 
-      const totalContactsForCampaign = await this.contactRepo.count({ where: { campaign: { id: camp.id } } });
+      // Verificar si la campaña ha terminado (sin contactos pendientes y sin llamadas activas)
       const currentlyCalling = await this.contactRepo.count({ where: { campaign: { id: camp.id }, callStatus: 'CALLING' } });
-
-      const stillPotentiallyProcessable = await this.contactRepo.count({
+      const processable = await this.contactRepo.count({
         where: {
           campaign: { id: camp.id },
           attemptCount: LessThan(camp.maxRetries),
-          callStatus: In([null, 'NOT_CALLED', 'FAILED'])
+          callStatus: In(['NOT_CALLED', 'FAILED'])
         }
       });
 
-      if (stillPotentiallyProcessable === 0 && currentlyCalling === 0) {
-        this.logger.log(`processCampaign: No quedan contactos procesables y ninguna llamada activa para campaña ${camp.id}. Marcando como COMPLETED.`);
+      if (processable === 0 && currentlyCalling === 0) {
+        this.logger.log(`Campaña ${camp.id} completada.`);
         camp.status = 'COMPLETED';
         await this.campaignRepo.save(camp);
         await this.channelLimitService.releaseChannels(camp.createdBy, camp.concurrentCalls);
@@ -489,15 +480,13 @@ export class CampaignService {
       this.logger.error(`Error crítico procesando la campaña ${campaignId}: ${error.message}`, error.stack);
     } finally {
       this.processingCampaigns.delete(campaignId);
-      this.logger.log(`processCampaign: Procesamiento finalizado y semáforo liberado para campaña ${campaignId}.`);
     }
   }
 
-
-  /** Recibe el resultado de una llamada (notificación de AMI).
-   * Actualiza el estado del contacto y, si la campaña está en RUNNING,
-   * llama a `processCampaign` para intentar rellenar el cupo concurrente.
-   * Incluye lógica para reintento inmediato si la causa es 'NO CONTESTO' (código 19) y `retryOnAnswer` es true.
+  /**
+   * Actualiza el estado del contacto.
+   * IMPORTANTE: Solo disparar processCampaign si el estado es final (SUCCESS/FAILED) 
+   * y la campaña sigue corriendo, para rellenar el hueco.
    */
   async updateContactStatusById(
     contactId: string,
@@ -508,94 +497,61 @@ export class CampaignService {
     answeredAt?: Date | null,
     finishedAt?: Date | null,
     clearChannelId: boolean = false,
-
   ): Promise<void> {
     this.dashboardGateway.sendUpdate({ event: 'call-finished' });
+    
     const contact = await this.contactRepo.findOne({ where: { id: contactId }, relations: ['campaign'] });
     if (!contact) {
-      this.logger.warn(`updateContactStatusById: Contacto ${contactId} no encontrado.`);
       return;
     }
     const campaign = contact.campaign;
 
+    // Lógica opcional: Reintento inmediato si retryOnAnswer es true y la causa fue "No Contesto" (19)
     if (
       status === 'FAILED' &&
       causeNumber === '19' &&
       campaign.retryOnAnswer === true &&
       contact.attemptCount < campaign.maxRetries
     ) {
-      this.logger.log(`[${contactId}] CAUSA 'NO CONTESTO'. Reintentando inmediatamente (Intento ${contact.attemptCount + 1}/${campaign.maxRetries}).`);
-
+      this.logger.log(`[${contactId}] Reintento inmediato por 'No Contesto'.`);
       contact.attemptCount++;
-      contact.startedAt = startedAt ?? null;
-      contact.answeredAt = answeredAt ?? null;
-      contact.finishedAt = finishedAt ?? null;
+      // Mantenemos timestamps previos o actualizamos según lógica deseada
       await this.contactRepo.save(contact);
 
       this.amiService.callWithTTS(contact.message, contact.phone, contact.id)
         .catch(err => {
-          this.logger.error(`[${contact.id}] Falló el reintento inmediato: ${err.message}`);
+          this.logger.error(`[${contact.id}] Falló reintento inmediato: ${err.message}`);
           contact.callStatus = 'FAILED';
-          contact.hangupCause = 'Fallo en reintento inmediato';
+          contact.hangupCause = 'Fallo reintento inmediato';
           this.contactRepo.save(contact);
         });
-
-      return;
+      return; 
     }
 
     contact.callStatus = status;
     contact.hangupCode = causeNumber || null;
     contact.hangupCause = causeMsg || null;
-    contact.startedAt = startedAt ?? null;
-    contact.answeredAt = answeredAt ?? null;
-    contact.finishedAt = finishedAt ?? null;
+    if (startedAt) contact.startedAt = startedAt;
+    if (answeredAt) contact.answeredAt = answeredAt;
+    if (finishedAt) contact.finishedAt = finishedAt;
+    
     if (clearChannelId) {
       contact.activeChannelId = null;
     }
+    
     await this.contactRepo.save(contact);
 
-    this.logger.log(
-      `Contacto ${contactId} actualizado a estado ${status} ` +
-      `(Causa: ${causeMsg || 'N/A'}) para campaña ${contact.campaign.id}. `
-    );
+    this.logger.log(`Contacto ${contactId} -> ${status} (${causeMsg || 'N/A'}).`);
 
-    if (contact.campaign.status === 'RUNNING') {
-      this.logger.log(`Campaña ${contact.campaign.id} está RUNNING, intentando rellenar cupo tras finalización de ${contactId}.`);
+    // Si la llamada finalizó (liberó un canal) y la campaña corre, intentamos llenar el hueco
+    if (['SUCCESS', 'FAILED'].includes(status) && contact.campaign.status === 'RUNNING') {
       this.processCampaign(contact.campaign.id);
     }
   }
 
-  private async limitConcurrency<T>(
-    items: T[],
-    concurrency: number,
-    fn: (item: T) => Promise<void>,
-  ) {
-    let index = 0;
-    const running: Promise<void>[] = [];
-
-    while (index < items.length || running.length > 0) {
-      while (running.length < concurrency && index < items.length) {
-        const item = items[index++];
-        const p = fn(item).finally(() => {
-          running.splice(running.indexOf(p), 1);
-        });
-        running.push(p);
-      }
-
-      if (running.length > 0) {
-        await Promise.race(running.map(p => p.catch(() => { })));
-      }
-      if (running.length >= concurrency && items.length > index) {
-        await Promise.race(running.map(p => p.catch(() => { })));
-      } else if (running.length > 0 && items.length <= index) {
-        await Promise.all(running.map(p => p.catch(() => { })));
-      } else if (running.length === 0 && items.length <= index) {
-        break;
-      }
-
-    }
-  }
-
+  // =================================================================================================
+  // MÉTODOS DE CONSULTA Y ESTADÍSTICAS (MANTENIDOS PARA COMPATIBILIDAD CON CONTROLADOR)
+  // =================================================================================================
 
   async getCampaignById(campaignId: string) {
     return this.campaignRepo.findOne({
@@ -607,32 +563,15 @@ export class CampaignService {
   async getAllCampaignsMinimal(
     userId: string,
     role: string
-  ): Promise<{
-    id: string;
-    name: string;
-    status: string;
-    startDate: Date;
-    endDate: Date;
-    createdBy: string;
-    maxRetries: number;
-    concurrentCalls: number;
-    retryOnAnswer: boolean;
-  }[]> {
+  ): Promise<any[]> {
     const whereClause: any = {};
     if (role === 'CALLCENTER') {
       whereClause.createdBy = userId;
     }
     return this.campaignRepo.find({
       select: [
-        'id',
-        'name',
-        'status',
-        'startDate',
-        'endDate',
-        'createdBy',
-        'maxRetries',
-        'concurrentCalls',
-        'retryOnAnswer',
+        'id', 'name', 'status', 'startDate', 'endDate', 'createdBy',
+        'maxRetries', 'concurrentCalls', 'retryOnAnswer',
       ],
       where: whereClause,
       order: { startDate: 'DESC' },
@@ -642,7 +581,7 @@ export class CampaignService {
   private buildRangeWhere(field: string, range: string) {
     if (range === 'day') return `${field} >= NOW() - INTERVAL '1 day'`;
     if (range === 'week') return `${field} >= NOW() - INTERVAL '7 days'`;
-    return `${field} >= NOW() - INTERVAL '1 month'`; // Default a 'month'
+    return `${field} >= NOW() - INTERVAL '1 month'`;
   }
 
   async getActiveCampaignCount(range = 'month'): Promise<number> {
@@ -736,21 +675,22 @@ export class CampaignService {
     return result;
   }
 
-  /** Obtiene un listado de contactos para una campaña con paginación, junto con un resumen de todos los estados de contacto de la campaña.
-   * Utiliza consultas SQL crudas para un resumen eficiente y filtro por estado.
-   */
   async getLiveContacts(
     campaignId: string,
-    status = 'ALL', // 'ALL', 'CALLING', 'SUCCESS', 'FAILED', 'PENDING'
+    status = 'ALL',
     limit = 50,
     offset = 0,
   ) {
     let statusFilter = '';
+    const params: any[] = [campaignId, limit, offset];
+    
     if (status !== 'ALL') {
       if (status === 'PENDING') {
         statusFilter = `AND (c."callStatus" IS NULL OR c."callStatus" NOT IN ('SUCCESS', 'FAILED', 'CALLING'))`;
       } else {
-        statusFilter = `AND c."callStatus" = '${status}'`;
+        // Uso de parámetro seguro
+        statusFilter = `AND c."callStatus" = $4`; 
+        params.push(status);
       }
     }
 
@@ -765,7 +705,7 @@ export class CampaignService {
       ORDER BY c.id DESC
       LIMIT $2 OFFSET $3
       `,
-      [campaignId, limit, offset],
+      params,
     );
 
     const [{ total, calling, success, failed, pending }] =
@@ -790,18 +730,21 @@ export class CampaignService {
 
   async getPages(campaignId: string, status = 'ALL', limit = 50) {
     let statusFilter = '';
+    const params: any[] = [campaignId];
+    
     if (status !== 'ALL') {
       if (status === 'PENDING') {
         statusFilter = `AND ("callStatus" IS NULL OR "callStatus" NOT IN ('SUCCESS', 'FAILED', 'CALLING'))`;
       } else {
-        statusFilter = `AND "callStatus" = '${status}'`;
+        statusFilter = `AND "callStatus" = $2`;
+        params.push(status);
       }
     }
 
     const [{ count }] = await this.contactRepo.query(
       `SELECT COUNT(*)::INT AS count
        FROM contact WHERE "campaignId" = $1 ${statusFilter}`,
-      [campaignId],
+      params,
     );
     return Math.max(1, Math.ceil(+count / limit));
   }

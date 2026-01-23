@@ -2,14 +2,14 @@ import { Injectable, CanActivate, ExecutionContext, ForbiddenException, SetMetad
 import { Reflector } from '@nestjs/core';
 import { User } from '../user/user.entity';
 
-export const RequirePermission = (permission: 'ivrs' | 'whatsapp') => SetMetadata('permission', permission);
+export const RequirePermission = (permission: 'ivrs') => SetMetadata('permission', permission);
 
 @Injectable()
 export class PermissionGuard implements CanActivate {
   constructor(private reflector: Reflector) {}
 
   canActivate(context: ExecutionContext): boolean {
-    const requiredPermission = this.reflector.get<'ivrs' | 'whatsapp'>(
+    const requiredPermission = this.reflector.get<'ivrs'>(
       'permission',
       context.getHandler(),
     );
@@ -24,14 +24,7 @@ export class PermissionGuard implements CanActivate {
       return false;
     }
 
-    let hasPermission = false;
-    if (requiredPermission === 'ivrs') {
-      hasPermission = user.canAccessIvrs;
-    } else if (requiredPermission === 'whatsapp') {
-      hasPermission = user.canAccessWhatsapp;
-    }
-
-    if (!hasPermission) {
+    if (requiredPermission === 'ivrs' && !user.canAccessIvrs) {
       throw new ForbiddenException('No tienes permiso para acceder a este módulo.');
     }
 

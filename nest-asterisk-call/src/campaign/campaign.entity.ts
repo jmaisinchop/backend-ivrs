@@ -1,4 +1,4 @@
-import { Entity, PrimaryGeneratedColumn, Column, OneToMany } from 'typeorm';
+import { Entity, PrimaryGeneratedColumn, Column, OneToMany, Index } from 'typeorm';
 import { Contact } from './contact.entity';
 
 @Entity()
@@ -9,6 +9,7 @@ export class Campaign {
   @Column()
   name: string;
 
+  @Index()
   @Column({ type: 'timestamp without time zone' })
   startDate: Date;
 
@@ -21,7 +22,7 @@ export class Campaign {
   @Column({ default: 2 })
   concurrentCalls: number;
 
-  // SCHEDULED, RUNNING, PAUSED, CANCELLED, COMPLETED
+  @Index() 
   @Column({ default: 'SCHEDULED' })
   status: string;
 
@@ -31,7 +32,7 @@ export class Campaign {
   @OneToMany(() => Contact, (contact) => contact.campaign)
   contacts: Contact[];
 
+  @Index() // Para filtrar campañas por usuario (Dashboard CallCenter)
   @Column({ nullable: true })
   createdBy: string;
-  
 }

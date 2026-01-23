@@ -5,8 +5,6 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { Campaign } from 'src/campaign/campaign.entity';
 import { Contact } from 'src/campaign/contact.entity';
 import { ChannelLimit } from 'src/channel-limit/channel-limit.entity';
-import { WhatsappCampaign } from 'src/whatsapp-campaign/whatsapp-campaign.entity';
-import { WhatsappContact } from 'src/whatsapp-campaign/whatsapp-contact.entity';
 
 @Module({
   imports: [
@@ -15,8 +13,6 @@ import { WhatsappContact } from 'src/whatsapp-campaign/whatsapp-contact.entity';
       Campaign,
       Contact,
       ChannelLimit,
-      WhatsappCampaign,
-      WhatsappContact, 
     ]),
   ],
   providers: [StatsService],

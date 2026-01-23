@@ -35,8 +35,6 @@ export class User {
     @Column({ default: true, comment: 'Permite el acceso al módulo de IVRS y campañas' })
     canAccessIvrs: boolean;
 
-    @Column({ default: true, comment: 'Permite el acceso al módulo de WhatsApp' })
-    canAccessWhatsapp: boolean;
 
     @Column({ nullable: true, comment: 'Número de extensión o teléfono del supervisor' })
     extension: string;

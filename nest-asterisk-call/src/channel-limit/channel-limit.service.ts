@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ChannelLimit } from './channel-limit.entity';
@@ -8,6 +8,8 @@ import { User } from '../user/user.entity';
 
 @Injectable()
 export class ChannelLimitService {
+  private readonly logger = new Logger(ChannelLimitService.name);
+
   constructor(
     @InjectRepository(ChannelLimit)
     private readonly channelLimitRepo: Repository<ChannelLimit>,
@@ -35,78 +37,93 @@ export class ChannelLimitService {
   }
 
   async canAssignChannels(userId: string, requested: number): Promise<boolean> {
-    const max = await this.getUserLimit(userId);
-    const used = await this.getUsedChannels(userId);
-    return used + requested <= max;
+    const entry = await this.channelLimitRepo.findOne({ where: { user: { id: userId } } });
+    if (!entry) return false;
+    return (entry.usedChannels + requested) <= entry.maxChannels;
   }
 
+  /**
+   * Reserva canales de forma ATÓMICA.
+   * Realiza la suma directamente en la base de datos con una condición WHERE para asegurar
+   * que no se exceda el límite en condiciones de alta concurrencia.
+   */
   async reserveChannels(userId: string, amount: number): Promise<void> {
-    const entry = await this.channelLimitRepo.findOne({
-      where: { user: { id: userId } }
-    });
-    if (!entry) {
-      throw new BadRequestException('No tienes límite de canales asignado');
-    }
-    entry.usedChannels = (entry.usedChannels || 0) + amount;
-    if (entry.usedChannels > entry.maxChannels) {
+    // Intentamos actualizar directamente solo si el nuevo valor no excede el máximo
+    const result = await this.channelLimitRepo
+      .createQueryBuilder()
+      .update(ChannelLimit)
+      .set({
+        usedChannels: () => `"usedChannels" + ${amount}`
+      })
+      .where('"userId" = :userId', { userId })
+      .andWhere('("usedChannels" + :amount) <= "maxChannels"', { amount })
+      .execute();
+
+    if (result.affected === 0) {
+      // Si no se actualizó ninguna fila, es porque no existe el usuario o se excedería el límite
+      const limit = await this.getUserLimit(userId);
+      const used = await this.getUsedChannels(userId);
+      this.logger.warn(`Fallo al reservar ${amount} canales para ${userId}. Usados: ${used}, Max: ${limit}`);
+      
       throw new BadRequestException(
-        `Intentas usar ${entry.usedChannels} de ${entry.maxChannels} canales`
+        `No hay suficientes canales disponibles. (Max: ${limit}, Usados: ${used}, Solicitados: ${amount})`
       );
     }
-    await this.channelLimitRepo.save(entry);
   }
 
+  /**
+   * Libera canales de forma segura, evitando números negativos.
+   */
   async releaseChannels(userId: string, amount: number): Promise<void> {
-    const entry = await this.channelLimitRepo.findOne({
-      where: { user: { id: userId } }
-    });
-    if (!entry) return;
-    entry.usedChannels = Math.max(0, (entry.usedChannels || 0) - amount);
-    await this.channelLimitRepo.save(entry);
+    await this.channelLimitRepo
+      .createQueryBuilder()
+      .update(ChannelLimit)
+      .set({
+        usedChannels: () => `GREATEST("usedChannels" - ${amount}, 0)` // Evita negativos
+      })
+      .where('"userId" = :userId', { userId })
+      .execute();
   }
 
-async assignChannels(user: User, newMax: number): Promise<ChannelLimit> {
-  const sys = await this.systemRepo.findOne({ where: {} });
-  if (!sys) throw new Error('Debes configurar totalChannels primero');
+  async assignChannels(user: User, newMax: number): Promise<ChannelLimit> {
+    const sys = await this.systemRepo.findOne({ where: {} });
+    if (!sys) throw new Error('Debes configurar totalChannels primero en el sistema.');
 
-  let entry = await this.channelLimitRepo.findOne({
-    where: { user: { id: user.id } },
-  });
-
-  const { sum } = await this.channelLimitRepo
-    .createQueryBuilder('cl')
-    .select('COALESCE(SUM(cl.maxChannels),0)', 'sum')
-    .where('cl.userId != :uid', { uid: user.id })
-    .getRawOne<{ sum: string }>();
-
-  const assignedByOthers = Number(sum);
-  const available        = sys.totalChannels - assignedByOthers;
-
-  if (newMax > available) {
-    throw new BadRequestException(
-      `Solo quedan ${available} canales libres de ${sys.totalChannels}.`
-    );
-  }
-
-  if (!entry) {
-    entry = this.channelLimitRepo.create({
-      user,
-      maxChannels: newMax,
-      usedChannels: 0,
+    let entry = await this.channelLimitRepo.findOne({
+      where: { user: { id: user.id } },
     });
-  } else {
-    if (entry.usedChannels > newMax) {
+
+    const { sum } = await this.channelLimitRepo
+      .createQueryBuilder('cl')
+      .select('COALESCE(SUM(cl.maxChannels),0)', 'sum')
+      .where('cl.userId != :uid', { uid: user.id })
+      .getRawOne<{ sum: string }>();
+
+    const assignedByOthers = Number(sum);
+    const available = sys.totalChannels - assignedByOthers;
+
+    if (newMax > available) {
       throw new BadRequestException(
-        `El usuario está usando ${entry.usedChannels} canales; no puedes fijar el límite en ${newMax}.`
+        `Solo quedan ${available} canales libres de ${sys.totalChannels} en el sistema global.`
       );
     }
-    entry.maxChannels = newMax;
+
+    if (!entry) {
+      entry = this.channelLimitRepo.create({
+        user,
+        maxChannels: newMax,
+        usedChannels: 0,
+      });
+    } else {
+      // Permitimos cambiar el límite aunque esté en uso, pero advertimos si queda "overbooked"
+      if (entry.usedChannels > newMax) {
+        this.logger.warn(`Usuario ${user.id} tiene en uso ${entry.usedChannels}, pero su nuevo límite es ${newMax}. Se ajustará eventualmente.`);
+      }
+      entry.maxChannels = newMax;
+    }
+
+    return this.channelLimitRepo.save(entry);
   }
-
-  return this.channelLimitRepo.save(entry);
-}
-
-
 
   async getAllLimits(): Promise<ChannelLimit[]> {
     return this.channelLimitRepo.find({ relations: ['user'] });

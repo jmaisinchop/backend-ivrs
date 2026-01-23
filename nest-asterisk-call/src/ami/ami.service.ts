@@ -45,6 +45,8 @@ export class AmiService implements OnModuleInit {
   private readonly logger = new Logger('AmiService');
   private ari: any;
   private readonly trunks = ['gsmDinstar', 'gsmDinstar2', 'gsmDinstar3', 'gsmDinstar5'];
+  
+  // Mapea ChannelID -> Datos de la llamada en curso
   private flags = new Map<string, CallFlags>();
   private readonly ariEvents = new EventEmitter();
 
@@ -71,8 +73,15 @@ export class AmiService implements OnModuleInit {
         setTimeout(() => this.connectAri(), WS_RETRY_MS);
       });
 
+      // Manejo de inicio de llamada (StasisStart)
       this.ari.on('StasisStart', (event: any, channel: any) => {
         this.handleStasisStart(event, channel);
+      });
+
+      // CRÍTICO: Manejo de fin de llamada (StasisEnd)
+      // Esto libera el slot de concurrencia realmente cuando cuelgan.
+      this.ari.on('StasisEnd', (event: any, channel: any) => {
+        this.handleStasisEnd(event, channel);
       });
 
       await this.ari.start('stasis-app');
@@ -83,9 +92,35 @@ export class AmiService implements OnModuleInit {
     }
   }
 
+  // Lógica para detectar cuando la llamada termina realmente
+  private async handleStasisEnd(event: any, channel: any) {
+    const f = this.flags.get(channel.id);
+    if (f) {
+        this.logger.log(`[StasisEnd] Canal ${channel.id} terminó. Contacto: ${f.contactId}`);
+        
+        // Si la llamada fue contestada (UP), ahora sí la marcamos como SUCCESS (finalizada exitosamente)
+        if (f.up) {
+            await this.campaigns.updateContactStatusById(
+                f.contactId, 
+                'SUCCESS', 
+                '16', 
+                'Finalización normal', 
+                null, // startedAt (no cambia)
+                null, // answeredAt (no cambia)
+                new Date(), // finishedAt (Ahora mismo)
+                true // Limpiar channelId para que no sea zombi
+            );
+        }
+        // Si NO fue UP (no contestaron), el método tryCallRaw ya se encargó de marcarla como FAILED.
+        
+        this.flags.delete(channel.id);
+    }
+  }
+
   private async handleStasisStart(event: any, channel: any) {
     this.logger.log(`[StasisStart] Canal ${channel.id} entró en la aplicación.`);
     
+    // Lógica de Espionaje (Supervisor)
     const varResult = await channel.getChannelVar({ variable: 'SPY_LEG' }).catch(() => ({value: null}));
     const isSpyLeg = varResult.value === 'true';
     
@@ -93,23 +128,17 @@ export class AmiService implements OnModuleInit {
       this.logger.log(`[StasisStart] El canal ${channel.id} es una llamada para el supervisor. Contestando...`);
       try {
         await channel.answer();
-        this.logger.log(`[StasisStart] Canal ${channel.id} contestado.`);
-        
         const masterIdResult = await channel.getChannelVar({ variable: 'SPY_MASTER_ID' });
         const spyMasterId = masterIdResult.value;
 
         if (spyMasterId) {
             this.logger.log(`[StasisStart] Emitting 'supervisor_answered' para ${spyMasterId}`);
             this.ariEvents.emit(`supervisor_answered_${spyMasterId}`, { supervisorChannel: channel });
-        } else {
-            this.logger.error(`[StasisStart] No se encontró SPY_MASTER_ID en el canal ${channel.id}`);
         }
       } catch (err: any) {
-        this.logger.error(`[StasisStart] Error al contestar el canal del supervisor ${channel.id}: ${err.message}`);
-        const masterIdResult = await channel.getChannelVar({ variable: 'SPY_MASTER_ID' }).catch(() => ({value: null}));
-        if(masterIdResult.value) {
-            this.ariEvents.emit(`supervisor_failed_${masterIdResult.value}`, new Error('No se pudo contestar la llamada del supervisor.'));
-        }
+        this.logger.error(`[StasisStart] Error supervisor ${channel.id}: ${err.message}`);
+        const m = await channel.getChannelVar({ variable: 'SPY_MASTER_ID' }).catch(() => ({value: null}));
+        if(m.value) this.ariEvents.emit(`supervisor_failed_${m.value}`, new Error('Fallo al contestar supervisor.'));
       }
     }
     // Lógica para llamadas de campaña (reproducción de audio)
@@ -118,9 +147,10 @@ export class AmiService implements OnModuleInit {
         if (f && f.up) {
             const contact = await this.campaigns.findContactById(f.contactId);
             if(contact && contact.message) {
+                // El audio ya debería estar generado, pero por seguridad lo regeneramos/buscamos
                 const audio = await this.generateTts(contact.message).catch(() => null);
                 if (audio) {
-                    this.logger.log(`[StasisStart] Reproduciendo audio ${audio} en canal de campaña ${channel.id}`);
+                    this.logger.log(`[StasisStart] Reproduciendo audio ${audio} en canal ${channel.id}`);
                     channel.play({ media: `sound:campanas/${audio}` }, (err: any, playback: any) => {
                         if (err) {
                             this.logger.error(`[StasisStart-Playback] Error: ${err.message}`);
@@ -132,6 +162,9 @@ export class AmiService implements OnModuleInit {
                             channel.hangup().catch(() => {});
                         });
                     });
+                } else {
+                    this.logger.error(`[StasisStart] No se pudo obtener audio para contacto ${f.contactId}. Colgando.`);
+                    channel.hangup().catch(() => {});
                 }
             }
         }
@@ -147,7 +180,6 @@ export class AmiService implements OnModuleInit {
       throw new Error('La llamada del contacto no está activa o no se encontró.');
     }
     const channelToSpyId = contact.activeChannelId;
-    this.logger.log(`[SPY:${callId}] Canal a espiar: ${channelToSpyId}`);
 
     return new Promise(async (resolve, reject) => {
         const cleanup = () => {
@@ -157,54 +189,48 @@ export class AmiService implements OnModuleInit {
 
         this.ariEvents.once(`supervisor_answered_${callId}`, async ({ supervisorChannel }) => {
             cleanup();
-            this.logger.log(`[SPY:${callId}] Evento 'supervisor_answered' recibido para canal ${supervisorChannel.id}.`);
             try {
-                // --- CORRECCIÓN FINAL ---
-                // Cambiamos 'in' por 'both' para escuchar ambas direcciones del audio.
+                // spy: 'both' escucha ambas direcciones
                 const snoopChannel = await this.ari.channels.snoopChannel({
                     channelId: channelToSpyId, app: 'stasis-app', spy: 'both',
                 });
-                // --- FIN DE LA CORRECCIÓN ---
-
-                this.logger.log(`[SPY:${callId}] Canal de espionaje creado: ${snoopChannel.id}`);
-
+                
                 const bridge = this.ari.Bridge();
                 await bridge.create({ type: 'mixing' });
-                this.logger.log(`[SPY:${callId}] Puente creado: ${bridge.id}`);
-
                 await bridge.addChannel({ channel: [supervisorChannel.id, snoopChannel.id] });
-                this.logger.log(`[SPY:${callId}] Canales añadidos al puente. Espionaje activo.`);
+                
+                this.logger.log(`[SPY:${callId}] Espionaje activo.`);
 
+                // Limpieza si el supervisor cuelga
                 supervisorChannel.once('StasisEnd', () => {
-                    this.logger.log(`[SPY:${callId}] El supervisor colgó. Limpiando.`);
+                    this.logger.log(`[SPY:${callId}] Supervisor colgó.`);
                     snoopChannel.hangup().catch(() => {});
                     bridge.destroy().catch(() => {});
                 });
+
+                // NUEVO: Limpieza si el cliente cuelga (StasisEnd del canal original)
+                // (Esto se maneja indirectamente porque snoopChannel morirá si el canal original muere, 
+                // pero es buena práctica estar atentos a errores en el snoop).
                 
                 resolve({ message: 'Conectado a la llamada.' });
             } catch (err: any) {
-                this.logger.error(`[SPY:${callId}] Error al crear snoop/bridge: ${err.message}`);
+                this.logger.error(`[SPY:${callId}] Error bridge: ${err.message}`);
                 supervisorChannel.hangup().catch(() => {});
-                reject(new Error('Error al conectar los canales de espionaje.'));
+                reject(new Error('Error al conectar espionaje.'));
             }
         });
 
         this.ariEvents.once(`supervisor_failed_${callId}`, (err: Error) => {
             cleanup();
-            this.logger.error(`[SPY:${callId}] Evento 'supervisor_failed' recibido: ${err.message}`);
             reject(err);
         });
 
         try {
-            this.logger.log(`[SPY:${callId}] Originando llamada a extensión interna ${supervisorExtension}`);
             await this.ari.channels.originate({
                 endpoint: `Local/${supervisorExtension}@from-internal`,
                 callerId: 'Supervisor',
                 app: 'stasis-app',
-                variables: {
-                    'SPY_LEG': 'true',
-                    'SPY_MASTER_ID': callId,
-                },
+                variables: { 'SPY_LEG': 'true', 'SPY_MASTER_ID': callId },
             });
         } catch (err: any) {
             this.ariEvents.emit(`supervisor_failed_${callId}`, err);
@@ -213,46 +239,66 @@ export class AmiService implements OnModuleInit {
   }
 
   public async callWithTTS(text: string, phone: string, contactId: string): Promise<void> {
-    this.logger.log(`[${contactId}] Inicio callWithTTS ${phone}`);
     const initialCallAttemptStartedAt = new Date();
     this.dashboardGateway.sendUpdate({ event: 'call-initiated' });
-    await this.persist(contactId, 'CALLING', '', 'Calling', initialCallAttemptStartedAt, null, null).catch(() => { });
-
+    
+    // Generamos el audio ANTES de iniciar la llamada para asegurar que existe
     const audio = await this.generateTts(text).catch(() => null);
     if (!audio) {
-      this.dashboardGateway.sendUpdate({ event: 'call-finished' });
-      await this.persist(contactId, 'FAILED', '', 'TTS ERROR', initialCallAttemptStartedAt, null, new Date()).catch(() => { });
+      await this.persist(contactId, 'FAILED', '', 'TTS ERROR', initialCallAttemptStartedAt, null, new Date());
       return;
     }
-    this.logger.log(`[${contactId}] Audio listo (${audio})`);
+
+    // Iniciamos persistencia básica
+    await this.persist(contactId, 'CALLING', '', 'Calling', initialCallAttemptStartedAt, null, null).catch(() => { });
 
     let final: CallResult = {
       success: false, causeNum: '', causeMsg: 'No trunks attempted',
       startedAt: initialCallAttemptStartedAt, answeredAt: null, finishedAt: new Date()
     };
 
+    // Intentar por cada troncal
     for (const trunk of this.trunks) {
-      this.logger.log(`[${contactId}] Probando troncal ${trunk} con audio ${audio}`);
       let attemptSpecificStartedAt = new Date();
       try {
         final = await this.tryCallRaw(contactId, trunk, phone, audio, attemptSpecificStartedAt);
       } catch (e: any) {
-        this.logger.error(`[${contactId}] Error catastrófico en tryCallRaw con troncal ${trunk}: ${e.message}`);
+        this.logger.error(`[${contactId}] Error tryCallRaw ${trunk}: ${e.message}`);
         final = {
-          success: false, causeNum: 'ERROR_INTERNO', causeMsg: 'Error originando llamada',
+          success: false, causeNum: 'ERROR_INTERNO', causeMsg: 'Error originando',
           startedAt: attemptSpecificStartedAt, answeredAt: null, finishedAt: new Date()
         };
       }
+      // Si contestaron (16) o está ocupado (17), no probar más troncales
       if (final.success || final.causeNum === '16' || final.causeNum === '17') {
         break;
       }
     }
 
-    await this.persist(
-      contactId, final.success ? 'SUCCESS' : 'FAILED', final.causeNum, final.causeMsg,
-      initialCallAttemptStartedAt, final.answeredAt, final.finishedAt,
-    ).catch(() => { });
-    this.logger.log(`[${contactId}] Resultado final → ${final.causeMsg}`);
+    // LÓGICA CRÍTICA DE ESTADO:
+    if (final.success) {
+        // La llamada fue contestada.
+        // NO la marcamos como SUCCESS (finalizada) todavía.
+        // Solo actualizamos que fue contestada (answeredAt) y mantenemos CALLING.
+        // El evento StasisEnd se encargará de ponerla en SUCCESS cuando cuelguen.
+        this.logger.log(`[${contactId}] Contestada. Manteniendo estado CALLING hasta fin de llamada.`);
+        await this.campaigns.updateContactStatusById(
+            contactId, 
+            'CALLING', // Mantenemos CALLING
+            final.causeNum, 
+            final.causeMsg, 
+            final.startedAt, 
+            final.answeredAt, 
+            null // finishedAt es NULL porque sigue viva
+        );
+    } else {
+        // La llamada falló (Ocupado, No contesta, Error).
+        // Marcamos como FAILED inmediatamente para liberar el slot y permitir reintentos.
+        await this.persist(
+          contactId, 'FAILED', final.causeNum, final.causeMsg,
+          initialCallAttemptStartedAt, final.answeredAt, final.finishedAt,
+        ).catch(() => { });
+    }
   }
 
   private async tryCallRaw(
@@ -260,51 +306,42 @@ export class AmiService implements OnModuleInit {
     attemptStartedAt: Date
   ): Promise<CallResult> {
     const callId = uuidv4();
+    // Guardamos flags iniciales
     this.flags.set(callId, { contactId, rang: false, up: false });
-    this.logger.log(`[${callId}] Originando ${phone} via ${trunk} (Attempt started: ${attemptStartedAt.toISOString()})`);
     
     if (contactId) {
       await this.campaigns.updateContactChannelId(contactId, callId);
     }
     
-    let ariChannel: any = null;
-    let eventCauseCode = -1;
-    let eventChannelDestroyed = false;
-    let attemptAnsweredAt: Date | null = null;
-    let attemptFinishedAt: Date | null = null;
-
     return new Promise<CallResult>((resolve) => {
-      let isPromiseResolved = false;
+      let resolved = false;
 
-      const resolveOnce = (result: Omit<CallResult, 'startedAt' | 'answeredAt' | 'finishedAt'>) => {
-        if (!isPromiseResolved) {
-          isPromiseResolved = true;
-          if (!attemptFinishedAt) attemptFinishedAt = new Date();
-          if (mainTimeoutId) clearTimeout(mainTimeoutId);
-          this.flags.delete(callId);
+      // Función helper para resolver la promesa una única vez
+      const finish = (res: Omit<CallResult, 'startedAt' | 'answeredAt' | 'finishedAt'> & { answeredAt?: Date | null }) => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          // OJO: No borramos this.flags(callId) si fue UP, porque StasisEnd lo necesita.
+          // Solo lo borramos si falló (no up).
+          const currentFlags = this.flags.get(callId);
+          if (!currentFlags?.up) {
+              this.flags.delete(callId);
+          }
+          
           resolve({
-            ...result,
+            ...res,
             startedAt: attemptStartedAt,
-            answeredAt: attemptAnsweredAt,
-            finishedAt: attemptFinishedAt
+            answeredAt: res.answeredAt || null,
+            finishedAt: new Date() // Solo relevante si falló
           });
         }
       };
 
-      const mainTimeoutId = setTimeout(() => {
-        if (isPromiseResolved) return;
-        this.logger.warn(`[${callId}] Timeout principal (${ORIGINATE_TIMEOUT_MS}ms) alcanzado.`);
-        attemptFinishedAt = new Date();
-
-        if (ariChannel && !eventChannelDestroyed) {
-          this.logger.warn(`[${callId}] Forzando hangup del canal por timeout principal.`);
-          ariChannel.hangup().catch((err: any) => {
-            this.logger.error(`[${callId}] Error al colgar en timeout principal: ${err.message}`);
-          });
-        }
-        const currentFlags = this.flags.get(callId) || { contactId, rang: false, up: false };
-        resolveOnce(this.interpret(eventCauseCode, currentFlags.up, true));
-
+      const timer = setTimeout(() => {
+        this.logger.warn(`[${callId}] Timeout originate.`);
+        // Intentar obtener causa del flag
+        const currentFlags = this.flags.get(callId);
+        finish(this.interpret(-1, currentFlags?.up || false, true));
       }, ORIGINATE_TIMEOUT_MS);
 
       this.ari.channels.originate({
@@ -315,63 +352,44 @@ export class AmiService implements OnModuleInit {
         channelId: callId,
       })
         .then((ch: any) => {
-          ariChannel = ch;
-
+          // Listeners específicos para este canal
           ch.on('ChannelDestroyed', (ev: any) => {
-            this.logger.log(`[${ch.id}] Evento: ChannelDestroyed, Causa: ${ev.cause}, Causa Num: ${ev.cause_code}`);
-            eventChannelDestroyed = true;
-            attemptFinishedAt = new Date();
-            eventCauseCode = ev.cause_code ?? ev.cause ?? -1;
-            const currentFlags = this.flags.get(ch.id) || { contactId, rang: false, up: false };
-            resolveOnce(this.interpret(eventCauseCode, currentFlags.up));
+            const cause = ev.cause_code ?? ev.cause ?? -1;
+            const currentFlags = this.flags.get(callId);
+            finish(this.interpret(cause, currentFlags?.up || false));
           });
 
-          ch.on('ChannelStateChange', (_ev: any, channelState: { id: string, state: string }) => {
-            if (channelState.id !== ch.id) return;
-            this.logger.log(`[${ch.id}] Evento: ChannelStateChange, Nuevo Estado: ${channelState.state}`);
-            const f = this.flags.get(ch.id);
+          ch.on('ChannelStateChange', (_ev: any, st: { state: string }) => {
+            const f = this.flags.get(callId);
             if (f) {
-              if (channelState.state === 'Ringing') f.rang = true;
-              if (channelState.state === 'Up') {
-                if (f.up) return;
+              if (st.state === 'Ringing') f.rang = true;
+              if (st.state === 'Up') {
+                if (f.up) return; // Ya estaba arriba
                 f.up = true;
-                if (!attemptAnsweredAt) attemptAnsweredAt = new Date();
-                this.logger.log(`[${ch.id}] Llamada contestada (${attemptAnsweredAt.toISOString()}).`);
-                // La reproducción ahora se maneja en StasisStart
+                this.logger.log(`[${callId}] Llamada contestada (UP).`);
+                // Resolvemos la promesa indicando éxito
+                finish({ success: true, causeNum: '16', causeMsg: 'Contestada', answeredAt: new Date() });
               }
             }
           });
         })
         .catch((err: any) => {
-          this.logger.error(`[${callId}] Error al originar la llamada: ${err.message}`);
-          attemptFinishedAt = new Date();
-          resolveOnce({ success: false, causeNum: 'FAIL_ORIGINATE', causeMsg: `Error originando: ${err.message}` });
+          this.logger.error(`[${callId}] Error originate catch: ${err.message}`);
+          finish({ success: false, causeNum: 'FAIL', causeMsg: err.message });
         });
     });
   }
 
-  private interpret(cause: number, up: boolean, isTimeout: boolean = false): Omit<CallResult, 'startedAt' | 'answeredAt' | 'finishedAt'> {
+  private interpret(cause: number, up: boolean, isTimeout: boolean = false) {
+    if (up) {
+        return { success: true, causeNum: '16', causeMsg: 'Contestada' };
+    }
     if (isTimeout) {
-      if (!up && cause === -1) {
-        return { success: false, causeNum: '19', causeMsg: CAUSES[19] || 'No contestó (Timeout)' };
-      }
-      if (up && cause === 16) {
-        return { success: true, causeNum: '16', causeMsg: 'Llamada contestada' };
-      }
-      if (up && cause === -1) {
-        return { success: false, causeNum: '-1', causeMsg: 'Llamada contestada pero finalizó por timeout sin causa Asterisk' };
-      }
+        return { success: false, causeNum: '19', causeMsg: CAUSES[19] || 'Timeout' };
     }
-
-    if (cause === 16 && up) {
-      return { success: true, causeNum: '16', causeMsg: 'Llamada contestada' };
-    }
-    if (cause === 16 && !up) {
-      return { success: false, causeNum: '16', causeMsg: CAUSES[19] || 'No contestó' };
-    }
-
-    const msg = CAUSES[cause] ?? `Fallo desconocido (Causa ${cause})`;
-    return { success: false, causeNum: cause >= 0 ? `${cause}` : String(cause), causeMsg: msg };
+    const msg = CAUSES[cause] ?? `Fallo desconocido (${cause})`;
+    // Si la causa es 16 pero no fue UP, es que colgaron antes de contestar o falló algo raro. Tratamos como fallo.
+    return { success: false, causeNum: String(cause), causeMsg: msg };
   }
 
   private async generateTts(text: string): Promise<string | null> {
@@ -402,21 +420,15 @@ export class AmiService implements OnModuleInit {
   ) {
     if (!id) return;
     try {
+      // Si el status es final, limpiamos el channelId en la DB
       const shouldClearChannelId = status === 'SUCCESS' || status === 'FAILED';
       await this.campaigns.updateContactStatusById(id, status, num, msg, startedAt, answeredAt, finishedAt, shouldClearChannelId);
     }
     catch (e: any) { this.logger.error(`Persist fail for contact ${id}: ${e.message}`); }
   }
 
-  async updateContactStatusById(
-    id: string,
-    s: string,
-    n?: string,
-    m?: string,
-    startedAt?: Date | null,
-    answeredAt?: Date | null,
-    finishedAt?: Date | null
-  ) {
-    return this.campaigns.updateContactStatusById(id, s, n, m, startedAt, answeredAt, finishedAt);
+  // Wrapper para compatibilidad si fuera necesario
+  async updateContactStatusById(id: string, s: string, n?: string, m?: string, start?: Date, ans?: Date, fin?: Date) {
+    return this.campaigns.updateContactStatusById(id, s, n, m, start, ans, fin);
   }
 }

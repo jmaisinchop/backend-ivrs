@@ -2,6 +2,10 @@ import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, Index, Generated } f
 import { Campaign } from './campaign.entity';
 
 @Entity()
+// ÍNDICES CRÍTICOS PARA EL RENDIMIENTO
+@Index(['campaign', 'callStatus']) // Para contar estados rápidamente
+@Index(['campaign', 'callStatus', 'attemptCount']) // Para processCampaign (saber a quién llamar)
+@Index(['callStatus']) // Para métricas globales
 export class Contact {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -30,10 +34,11 @@ export class Contact {
 
   @Column({ nullable: true })
   hangupCode: string; 
+  
   @Column({ nullable: true })
   hangupCause: string; 
 
-  @Index()
+  @Index() // Índice simple para ordenamiento
   @Column({ type: 'bigint' })
   @Generated('increment')
   sequence: number;

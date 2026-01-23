@@ -21,19 +21,11 @@ export class StatsController {
   }
 
 
-  @Get('ivr-status-distribution')
+  @Get('status-distribution')
   getIvrStatusDistribution(@Req() req) {
     const userId = this._uid(req);
     return this.stats.getCallStatusDistribution(30, userId);
   }
-
-
-  @Get('whatsapp-stats')
-  getWhatsappStats(@Req() req) {
-    const userId = this._uid(req);
-    return this.stats.getWhatsappStats(userId);
-  }
-
 
 
   @Get('overview')
