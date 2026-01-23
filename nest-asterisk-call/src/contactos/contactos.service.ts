@@ -11,7 +11,6 @@ export class ContactosService {
     ) { }
 
     async obtenerPadresNiveles(): Promise<any[]> {
-        // Esta consulta no recibe parámetros externos, es segura tal cual
         const sql = `
       WITH padres AS (
           SELECT
@@ -101,23 +100,31 @@ export class ContactosService {
     }
 
     async obtenerContactosPorNivel(niveles: string, esPropia: boolean): Promise<any[]> {
-        const nivelesArray = niveles.split(',').map(n => n.trim());
+        if (!niveles || typeof niveles !== 'string') {
+            throw new Error('Parámetro niveles inválido');
+        }
+
+        const nivelesArray = niveles.split(',').map(n => n.trim()).filter(n => n.length > 0);
+        
+        if (nivelesArray.length === 0) {
+            throw new Error('No se proporcionaron niveles válidos');
+        }
+
+        if (nivelesArray.length > 50) {
+            throw new Error('Demasiados niveles proporcionados (máximo 50)');
+        }
+
         const fechaActual = dayjs().format('MM-YYYY');
         
-        // Construimos la cláusula WHERE dinámicamente pero usando parámetros
-        // Generamos: (c.nivelcartera LIKE $1 OR c.nivelcartera LIKE $2 ...)
         const whereConditions = nivelesArray.map((_, index) => `c.nivelcartera LIKE $${index + 1}`).join(' OR ');
-        
-        // Preparamos los parámetros con los comodines % incluidos
         const parameters = nivelesArray.map(nivel => `%${nivel}%`);
 
-        // El siguiente parámetro disponible después de los niveles
         const nextParamIndex = parameters.length + 1;
 
         let sql = '';
         
         if (esPropia) {
-             sql = `
+            sql = `
             SELECT 
               ccc.cedula, 
               ccc.nombre, 
@@ -150,10 +157,10 @@ export class ContactosService {
               AND (c.observaciones IS NULL OR c.observaciones = '') 
               AND c.fechafinalizacion IS NULL
               AND ccnc.tiponumero LIKE UPPER('%TITULAR%')
+            LIMIT 100000
           `;
-          // No añadimos fechaActual a parameters porque en esta rama no se usaba en el SQL original
         } else {
-             sql = `
+            sql = `
             SELECT 
               ccc.cedula, 
               ccc.nombre, 
@@ -185,12 +192,16 @@ export class ContactosService {
               AND ccnc.valido = true 
               AND ccnc.tiponumero LIKE UPPER('%TITULAR%')
               AND c.fechacreacion LIKE $${nextParamIndex}
+            LIMIT 100000
           `;
-          // Añadimos el parámetro de fecha al final
           parameters.push(`%${fechaActual}%`);
         }
 
-        const result = await this.connection.query(sql, parameters);
-        return result;
+        try {
+            const result = await this.connection.query(sql, parameters);
+            return result;
+        } catch (error) {
+            throw new Error(`Error ejecutando consulta de contactos: ${error.message}`);
+        }
     }
 }

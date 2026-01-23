@@ -2,10 +2,11 @@ import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, Index, Generated } f
 import { Campaign } from './campaign.entity';
 
 @Entity()
-// ÍNDICES CRÍTICOS PARA EL RENDIMIENTO
-@Index(['campaign', 'callStatus']) // Para contar estados rápidamente
-@Index(['campaign', 'callStatus', 'attemptCount']) // Para processCampaign (saber a quién llamar)
-@Index(['callStatus']) // Para métricas globales
+@Index(['campaign', 'callStatus'])
+@Index(['campaign', 'callStatus', 'attemptCount'])
+@Index(['campaign', 'attemptCount'])
+@Index(['activeChannelId'], { where: '"activeChannelId" IS NOT NULL' })
+@Index(['finishedAt'], { where: '"callStatus" = \'FAILED\'' })
 export class Contact {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -23,12 +24,13 @@ export class Contact {
   @Column({ default: '' })
   phone: string;
 
-  @Column()
+  @Column({ type: 'text' })
   message: string;
 
   @Column({ default: 0 })
   attemptCount: number;
 
+  @Index()
   @Column({ default: 'NOT_CALLED' })
   callStatus: string;
 
@@ -38,7 +40,7 @@ export class Contact {
   @Column({ nullable: true })
   hangupCause: string; 
 
-  @Index() // Índice simple para ordenamiento
+  @Index()
   @Column({ type: 'bigint' })
   @Generated('increment')
   sequence: number;
@@ -51,12 +53,14 @@ export class Contact {
   })
   campaign: Campaign;
 
+  @Index()
   @Column({ type: 'timestamp', nullable: true, comment: 'Timestamp when the call process started for this contact' })
   startedAt: Date | null;
 
   @Column({ type: 'timestamp', nullable: true, comment: 'Timestamp when the call was answered' })
   answeredAt: Date | null;
 
+  @Index()
   @Column({ type: 'timestamp', nullable: true, comment: 'Timestamp when the call process finished for this contact' })
   finishedAt: Date | null;
 }

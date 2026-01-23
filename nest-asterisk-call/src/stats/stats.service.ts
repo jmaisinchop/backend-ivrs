@@ -8,57 +8,81 @@ import * as ExcelJS from 'exceljs';
 
 @Injectable()
 export class StatsService {
+  private readonly queryCache = new Map<string, { data: any; timestamp: number }>();
+  private readonly CACHE_TTL = 60000;
+
   constructor(
     @InjectRepository(Campaign) private campRepo: Repository<Campaign>,
     @InjectRepository(Contact) private contactRepo: Repository<Contact>,
     @InjectRepository(ChannelLimit) private limitRepo: Repository<ChannelLimit>,
-  ) { }
+  ) {
+    this.startCacheCleanup();
+  }
 
-  // OPTIMIZADO: Uso de índices en las fechas y status
-  private async getIvrMetricsForPeriod(days: number, offsetDays: number, userId?: string) {
-    const params: any[] = [days, offsetDays];
-    let userFilter = '';
-    
-    if (userId) {
-        userFilter = `AND c."createdBy" = $3`; // Quitamos el cast ::uuid innecesario si la columna es string o uuid nativo compatible
-        params.push(userId);
+  private startCacheCleanup(): void {
+    setInterval(() => {
+      const now = Date.now();
+      for (const [key, value] of this.queryCache.entries()) {
+        if (now - value.timestamp > this.CACHE_TTL) {
+          this.queryCache.delete(key);
+        }
+      }
+    }, 120000);
+  }
+
+  private getCachedOrExecute<T>(key: string, executor: () => Promise<T>): Promise<T> {
+    const cached = this.queryCache.get(key);
+    const now = Date.now();
+
+    if (cached && (now - cached.timestamp) < this.CACHE_TTL) {
+      return Promise.resolve(cached.data);
     }
 
-    // Nota: Esta query ya es bastante eficiente, pero depende de los índices en 'startDate' y 'status' que agregamos.
-    const query = `
-      SELECT
-        COUNT(DISTINCT CASE WHEN c.status IN ('RUNNING', 'PAUSED') THEN c.id END)::INT AS "activeCampaigns",
-        COUNT(CASE WHEN ct."callStatus" = 'CALLING' THEN 1 END)::INT AS "ongoingCalls",
-        COALESCE(
-          COUNT(CASE WHEN ct."callStatus" = 'SUCCESS' THEN 1 END)::DECIMAL / 
-          NULLIF(COUNT(CASE WHEN ct."callStatus" IN ('SUCCESS', 'FAILED') THEN 1 END), 0), 0
-        ) AS "successRate"
-      FROM campaign c
-      LEFT JOIN contact ct ON ct."campaignId" = c.id
-      WHERE c."startDate" BETWEEN NOW() - (($2::integer + $1::integer) * INTERVAL '1 day') AND NOW() - ($2::integer * INTERVAL '1 day')
-      ${userFilter}
-    `;
-
-    const [result] = await this.campRepo.query(query, params);
-
-    return {
-      activeCampaigns: result ? +result.activeCampaigns : 0,
-      ongoingCalls: result ? +result.ongoingCalls : 0,
-      successRate: result ? +result.successRate : 0
-    };
+    return executor().then(data => {
+      this.queryCache.set(key, { data, timestamp: now });
+      return data;
+    });
   }
 
-  // Helpers para reutilizar filtros
+  private async getIvrMetricsForPeriod(days: number, offsetDays: number, userId?: string) {
+    const cacheKey = `ivr_metrics_${days}_${offsetDays}_${userId || 'all'}`;
+    
+    return this.getCachedOrExecute(cacheKey, async () => {
+      const params: any[] = [days, offsetDays];
+      let userFilter = '';
+      
+      if (userId) {
+        userFilter = `AND c."createdBy" = $3`;
+        params.push(userId);
+      }
+
+      const query = `
+        SELECT
+          COUNT(DISTINCT CASE WHEN c.status IN ('RUNNING', 'PAUSED') THEN c.id END)::INT AS "activeCampaigns",
+          COUNT(CASE WHEN ct."callStatus" = 'CALLING' THEN 1 END)::INT AS "ongoingCalls",
+          COALESCE(
+            COUNT(CASE WHEN ct."callStatus" = 'SUCCESS' THEN 1 END)::DECIMAL / 
+            NULLIF(COUNT(CASE WHEN ct."callStatus" IN ('SUCCESS', 'FAILED') THEN 1 END), 0), 0
+          ) AS "successRate"
+        FROM campaign c
+        LEFT JOIN contact ct ON ct."campaignId" = c.id
+        WHERE c."startDate" BETWEEN NOW() - (($2::integer + $1::integer) * INTERVAL '1 day') AND NOW() - ($2::integer * INTERVAL '1 day')
+        ${userFilter}
+      `;
+
+      const [result] = await this.campRepo.query(query, params);
+
+      return {
+        activeCampaigns: result ? +result.activeCampaigns : 0,
+        ongoingCalls: result ? +result.ongoingCalls : 0,
+        successRate: result ? +result.successRate : 0
+      };
+    });
+  }
+
   private createdBy(idx: number) {
-    return `AND c."createdBy"::uuid = $${idx}::uuid`;
-  }
-  private createdByTxt(idx: number) {
     return `AND c."createdBy" = $${idx}`;
   }
-
-  // ... [MANTENER getCallsPerDay, getCallsPerMonth, getCallsPerHour IGUALES] ...
-  // No cambiamos estos métodos porque son reportes históricos, no tiempo real crítico.
-  // Pero se beneficiarán automáticamente de los índices creados.
 
   getCallsPerDay(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
@@ -73,28 +97,30 @@ export class StatsService {
       JOIN campaign c ON c.id = ct."campaignId"
       WHERE c."startDate" >= NOW() - ($1 * INTERVAL '1 day')
         ${extra}
-      GROUP BY 1 ORDER BY 1;`, params,
+      GROUP BY 1 ORDER BY 1
+      LIMIT 365;`, params,
     );
   }
 
   getCallsPerMonth(months = 12, userId?: string) {
-     const extra = userId ? this.createdBy(2) : '';
-     const params: (number | string)[] = [months];
-     if (userId) params.push(userId);
- 
-     return this.contactRepo.query(
-       `SELECT TO_CHAR(c."startDate",'YYYY-MM') AS month,
-              COUNT(*)::INT AS llamadas,
-              COUNT(*) FILTER (WHERE ct."callStatus"='SUCCESS')::INT AS exitosas
-       FROM contact ct
-       JOIN campaign c ON c.id = ct."campaignId"
-       WHERE c."startDate" >= DATE_TRUNC('month',NOW()) - ($1 * INTERVAL '1 month')
-         ${extra}
-       GROUP BY 1 ORDER BY 1;`, params,
-     );
-   }
+    const extra = userId ? this.createdBy(2) : '';
+    const params: (number | string)[] = [months];
+    if (userId) params.push(userId);
 
-   getCallsPerHour(days = 7, userId?: string) {
+    return this.contactRepo.query(
+      `SELECT TO_CHAR(c."startDate",'YYYY-MM') AS month,
+             COUNT(*)::INT AS llamadas,
+             COUNT(*) FILTER (WHERE ct."callStatus"='SUCCESS')::INT AS exitosas
+      FROM contact ct
+      JOIN campaign c ON c.id = ct."campaignId"
+      WHERE c."startDate" >= DATE_TRUNC('month',NOW()) - ($1 * INTERVAL '1 month')
+        ${extra}
+      GROUP BY 1 ORDER BY 1
+      LIMIT 24;`, params,
+    );
+  }
+
+  getCallsPerHour(days = 7, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
     const params: (number | string)[] = [days];
     if (userId) params.push(userId);
@@ -122,7 +148,8 @@ export class StatsService {
 
   getCallStatusDistribution(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; if (userId) params.push(userId);
+    const params: (number | string)[] = [days]; 
+    if (userId) params.push(userId);
 
     return this.contactRepo.query(
       `SELECT ct."callStatus" AS status, COUNT(*)::INT AS total
@@ -130,13 +157,15 @@ export class StatsService {
       JOIN campaign c ON c.id = ct."campaignId"
       WHERE c."startDate" >= NOW() - ($1 * INTERVAL '1 day')
         ${extra}
-      GROUP BY 1 ORDER BY 2 DESC;`, params,
+      GROUP BY 1 ORDER BY 2 DESC
+      LIMIT 20;`, params,
     );
   }
 
   getAttemptsEfficiency(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; if (userId) params.push(userId);
+    const params: (number | string)[] = [days]; 
+    if (userId) params.push(userId);
 
     return this.contactRepo.query(
       `SELECT ct."attemptCount"::INT AS attemptcount,
@@ -147,13 +176,15 @@ export class StatsService {
       JOIN campaign c ON c.id = ct."campaignId"
       WHERE c."startDate" >= NOW() - ($1 * INTERVAL '1 day')
         ${extra}
-      GROUP BY 1 ORDER BY 1;`, params,
+      GROUP BY 1 ORDER BY 1
+      LIMIT 50;`, params,
     );
   }
 
   async getRetryRate(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; if (userId) params.push(userId);
+    const params: (number | string)[] = [days]; 
+    if (userId) params.push(userId);
 
     const [row] = await this.contactRepo.query(
       `SELECT COUNT(*)::INT AS total,
@@ -169,7 +200,8 @@ export class StatsService {
 
   getFailureTrend(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; if (userId) params.push(userId);
+    const params: (number | string)[] = [days]; 
+    if (userId) params.push(userId);
 
     return this.contactRepo.query(
       `SELECT TO_CHAR(c."startDate",'YYYY-MM-DD') AS day, COUNT(*)::INT AS failed
@@ -178,13 +210,15 @@ export class StatsService {
       WHERE ct."callStatus"='FAILED'
         AND c."startDate" >= NOW() - ($1 * INTERVAL '1 day')
         ${extra}
-      GROUP BY 1 ORDER BY 1;`, params,
+      GROUP BY 1 ORDER BY 1
+      LIMIT 365;`, params,
     );
   }
 
   getSuccessRateByHour(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; if (userId) params.push(userId);
+    const params: (number | string)[] = [days]; 
+    if (userId) params.push(userId);
 
     return this.contactRepo.query(
       `SELECT EXTRACT(HOUR FROM c."startDate")::INT AS hour,
@@ -202,7 +236,8 @@ export class StatsService {
 
   getTopBusyHours(limit = 5, days = 30, userId?: string) {
     const extra = userId ? this.createdBy(3) : '';
-    const params: (number | string)[] = [limit, days]; if (userId) params.push(userId);
+    const params: (number | string)[] = [Math.min(limit, 24), days]; 
+    if (userId) params.push(userId);
 
     return this.contactRepo.query(
       `SELECT EXTRACT(HOUR FROM c."startDate")::INT AS hour, COUNT(*)::INT AS calls
@@ -216,7 +251,8 @@ export class StatsService {
 
   async getAvgCallsPerCampaign(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; if (userId) params.push(userId);
+    const params: (number | string)[] = [days]; 
+    if (userId) params.push(userId);
 
     const [{ avg }] = await this.contactRepo.query(
       `SELECT COALESCE(AVG(callcount),0)::NUMERIC(10,2) AS avg
@@ -236,7 +272,6 @@ export class StatsService {
     const extra = userId ? `AND "createdBy" = $1` : '';
     const params = userId ? [userId] : [];
 
-    // Optimizado: Las consultas son ligeras si campaign tiene índices en status
     const [{ min }] = await this.campRepo.query(
       `SELECT COALESCE(MIN(EXTRACT(EPOCH FROM NOW()-"startDate")/60),0)::INT AS min
        FROM campaign WHERE status='RUNNING' ${extra}`, params,
@@ -252,51 +287,52 @@ export class StatsService {
     return { min: +min, avg: +avg, max: +max };
   }
 
-  // OPTIMIZADO: getChannelPressure
   async getChannelPressure(userId?: string) {
-    // Si userId está presente, filtramos, si no, traemos todo.
-    // Usamos LEFT JOIN eficiente.
-    const sql = userId 
-    ? `
-      SELECT
-        cl."maxChannels"  AS total,
-        COALESCE(SUM(c."concurrentCalls"), 0) AS used,
-        CASE
-          WHEN cl."maxChannels" = 0 THEN 0
-          ELSE COALESCE(SUM(c."concurrentCalls"), 0)::float / cl."maxChannels"
-        END AS pressure
-      FROM channel_limit cl
-      LEFT JOIN campaign c
-        ON c."createdBy" = cl."userId"::text -- Ajuste de cast para asegurar coincidencia
-       AND c.status IN ('SCHEDULED','RUNNING','PAUSED')
-      WHERE cl."userId"::text = $1
-      GROUP BY cl."maxChannels";
-    `
-    : `
-      SELECT
-        SUM(cl."maxChannels")                  AS total,
-        COALESCE(SUM(c."concurrentCalls"), 0)   AS used,
-        CASE
-          WHEN SUM(cl."maxChannels") = 0 THEN 0
-          ELSE COALESCE(SUM(c."concurrentCalls"), 0)::float
-               / SUM(cl."maxChannels")
-        END AS pressure
-      FROM channel_limit cl
-      LEFT JOIN campaign c
-        ON c."createdBy" = cl."userId"::text
-       AND c.status IN ('SCHEDULED','RUNNING','PAUSED');
-    `;
+    const cacheKey = `channel_pressure_${userId || 'all'}`;
     
-    const params = userId ? [userId] : [];
-    const [row] = await this.limitRepo.query(sql, params);
-    
-    if (!row) return { total: 0, used: 0, pressure: 0 };
-    
-    return {
+    return this.getCachedOrExecute(cacheKey, async () => {
+      const sql = userId 
+      ? `
+        SELECT
+          cl."maxChannels"  AS total,
+          COALESCE(SUM(c."concurrentCalls"), 0) AS used,
+          CASE
+            WHEN cl."maxChannels" = 0 THEN 0
+            ELSE COALESCE(SUM(c."concurrentCalls"), 0)::float / cl."maxChannels"
+          END AS pressure
+        FROM channel_limit cl
+        LEFT JOIN campaign c
+          ON c."createdBy" = cl."userId"::text
+         AND c.status IN ('SCHEDULED','RUNNING','PAUSED')
+        WHERE cl."userId"::text = $1
+        GROUP BY cl."maxChannels";
+      `
+      : `
+        SELECT
+          SUM(cl."maxChannels")                  AS total,
+          COALESCE(SUM(c."concurrentCalls"), 0)   AS used,
+          CASE
+            WHEN SUM(cl."maxChannels") = 0 THEN 0
+            ELSE COALESCE(SUM(c."concurrentCalls"), 0)::float
+                 / SUM(cl."maxChannels")
+          END AS pressure
+        FROM channel_limit cl
+        LEFT JOIN campaign c
+          ON c."createdBy" = cl."userId"::text
+         AND c.status IN ('SCHEDULED','RUNNING','PAUSED');
+      `;
+      
+      const params = userId ? [userId] : [];
+      const [row] = await this.limitRepo.query(sql, params);
+      
+      if (!row) return { total: 0, used: 0, pressure: 0 };
+      
+      return {
         total: Number(row.total),
         used: Number(row.used),
         pressure: Number(row.pressure),
-    };
+      };
+    });
   }
 
   async getChannelUsageSnapshot() {
@@ -314,14 +350,16 @@ export class StatsService {
       ON c."createdBy" = cl."userId"::text
      AND c.status IN ('SCHEDULED','RUNNING','PAUSED')
     GROUP BY cl."userId", u.username, cl."maxChannels"
-    ORDER BY u.username;
+    ORDER BY u.username
+    LIMIT 1000;
   `;
     return this.limitRepo.query(sql);
   }
 
   getAgentPerformance(days = 30, userId?: string) {
     const userFilter = userId ? `WHERE u.id = $2::uuid` : '';
-    const params: (number | string)[] = [days]; if (userId) params.push(userId);
+    const params: (number | string)[] = [days]; 
+    if (userId) params.push(userId);
 
     return this.contactRepo.query(
       `SELECT u.id AS userid, u.username,
@@ -337,13 +375,15 @@ export class StatsService {
       LEFT JOIN contact ct ON ct."campaignId" = c.id
       ${userFilter}
       GROUP BY u.id, u.username
-      ORDER BY successrate DESC, totalcalls DESC;`, params,
+      ORDER BY successrate DESC, totalcalls DESC
+      LIMIT 100;`, params,
     );
   }
 
   getTopHangupCauses(limit = 5, days = 30, userId?: string) {
     const extra = userId ? this.createdBy(3) : '';
-    const params: (number | string)[] = [limit, days]; if (userId) params.push(userId);
+    const params: (number | string)[] = [Math.min(limit, 50), days]; 
+    if (userId) params.push(userId);
 
     return this.contactRepo.query(
       `SELECT COALESCE(ct."hangupCause",'Desconocida') AS cause, COUNT(*)::INT AS total
@@ -357,7 +397,7 @@ export class StatsService {
 
   getCampaignLeaderboard(limit = 5, userId?: string) {
     const where = userId ? `WHERE c."createdBy" = $2` : '';
-    const params: (number | string)[] = [limit];
+    const params: (number | string)[] = [Math.min(limit, 100)];
     if (userId) params.push(userId);
 
     return this.contactRepo.query(
@@ -376,79 +416,74 @@ export class StatsService {
     );
   }
 
-  // OPTIMIZADO: getOverview (La joya de la corona para el dashboard)
-  // Usamos los índices para evitar escaneos secuenciales
   async getOverview(userId?: string) {
-    const extra = userId ? `WHERE c."createdBy" = $1` : '';
-    const params = userId ? [userId] : [];
+    const cacheKey = `overview_${userId || 'all'}`;
+    
+    return this.getCachedOrExecute(cacheKey, async () => {
+      const extra = userId ? `WHERE c."createdBy" = $1` : '';
+      const params = userId ? [userId] : [];
 
-    // 1. Campañas activas (Rápido con índice en status)
-    const [{ active }] = await this.campRepo.query(
-      `SELECT COUNT(*)::INT AS active FROM campaign c WHERE c.status IN('RUNNING','PAUSED') ${userId ? `AND c."createdBy" = $1` : ''}`,
-      params,
-    );
-
-    // 2. Llamadas en curso (Rápido con índice en callStatus y join indexado)
-    const [{ calling }] = await this.contactRepo.query(
-      `SELECT COUNT(*)::INT AS calling
-      FROM contact ct
-      JOIN campaign c ON c.id = ct."campaignId"
-      WHERE ct."callStatus"='CALLING' ${userId ? `AND c."createdBy" = $1` : ''};`,
-      params,
-    );
-
-    // 3. Tasa de éxito global (Pesado, pero usa índices ahora)
-    const [{ sr }] = await this.contactRepo.query(
-      `SELECT CASE WHEN COUNT(*)=0 THEN 0
-                  ELSE COUNT(*) FILTER (WHERE ct."callStatus"='SUCCESS')::NUMERIC/COUNT(*)
-             END AS sr
-      FROM contact ct
-      JOIN campaign c ON c.id = ct."campaignId"
-      WHERE 1=1 ${userId ? `AND c."createdBy" = $1` : ''};`,
-      params,
-    );
-
-    // 4. Canales (Lógica separada y rápida)
-    if (userId) {
-      const [lim] = await this.limitRepo.query(
-        `SELECT "maxChannels"::INT AS max,"usedChannels"::INT AS used FROM channel_limit WHERE "userId"::text = $1`,
-        [userId],
+      const [{ active }] = await this.campRepo.query(
+        `SELECT COUNT(*)::INT AS active FROM campaign c WHERE c.status IN('RUNNING','PAUSED') ${userId ? `AND c."createdBy" = $1` : ''}`,
+        params,
       );
+
+      const [{ calling }] = await this.contactRepo.query(
+        `SELECT COUNT(*)::INT AS calling
+        FROM contact ct
+        JOIN campaign c ON c.id = ct."campaignId"
+        WHERE ct."callStatus"='CALLING' ${userId ? `AND c."createdBy" = $1` : ''};`,
+        params,
+      );
+
+      const [{ sr }] = await this.contactRepo.query(
+        `SELECT CASE WHEN COUNT(*)=0 THEN 0
+                    ELSE COUNT(*) FILTER (WHERE ct."callStatus"='SUCCESS')::NUMERIC/COUNT(*)
+               END AS sr
+        FROM contact ct
+        JOIN campaign c ON c.id = ct."campaignId"
+        WHERE 1=1 ${userId ? `AND c."createdBy" = $1` : ''};`,
+        params,
+      );
+
+      if (userId) {
+        const [lim] = await this.limitRepo.query(
+          `SELECT "maxChannels"::INT AS max,"usedChannels"::INT AS used FROM channel_limit WHERE "userId"::text = $1`,
+          [userId],
+        );
+        return {
+          activeCampaigns: +active,
+          ongoingCalls: +calling,
+          successRate: +sr,
+          channels: {
+            total: lim?.max ?? 0,
+            used: lim?.used ?? 0,
+            available: Math.max(0, (lim?.max ?? 0) - (lim?.used ?? 0)),
+          },
+        };
+      }
+
+      const [{ totalmax }] = await this.limitRepo.query(
+        `SELECT SUM("maxChannels")::INT AS totalmax FROM channel_limit`);
+      const [{ totalused }] = await this.limitRepo.query(
+        `SELECT SUM("usedChannels")::INT AS totalused FROM channel_limit`);
+
       return {
         activeCampaigns: +active,
         ongoingCalls: +calling,
         successRate: +sr,
         channels: {
-          total: lim?.max ?? 0,
-          used: lim?.used ?? 0,
-          available: Math.max(0, (lim?.max ?? 0) - (lim?.used ?? 0)),
+          total: +totalmax || 0,
+          used: +totalused || 0,
+          available: Math.max(0, (+totalmax || 0) - (+totalused || 0)),
         },
       };
-    }
-
-    const [{ totalmax }] = await this.limitRepo.query(
-      `SELECT SUM("maxChannels")::INT AS totalmax FROM channel_limit`);
-    const [{ totalused }] = await this.limitRepo.query(
-      `SELECT SUM("usedChannels")::INT AS totalused FROM channel_limit`);
-
-    return {
-      activeCampaigns: +active,
-      ongoingCalls: +calling,
-      successRate: +sr,
-      channels: {
-        total: +totalmax || 0,
-        used: +totalused || 0,
-        available: Math.max(0, (+totalmax || 0) - (+totalused || 0)),
-      },
-    };
+    });
   }
 
-  // ... [MANTENER getCampaignSummary, generateCampaignReport, getDashboardOverview, getAgentLeaderboard IGUALES] ...
-  // Solo asegúrate de que usan los índices implícitamente al hacer las queries.
-  
   async getCampaignSummary(start: string, end: string, userId?: string) {
     const params: string[] = [start, end];
-    const filter = userId ? this.createdByTxt(3) : '';
+    const filter = userId ? `AND c."createdBy" = $3` : '';
     if (userId) params.push(userId);
 
     return this.contactRepo.query(
@@ -476,7 +511,8 @@ export class StatsService {
           AND c."startDate"::date <= $2::date
           ${filter}
         GROUP BY c.id, u.username
-        ORDER BY c."startDate";`, params,
+        ORDER BY c."startDate"
+        LIMIT 10000;`, params,
     );
   }
 
@@ -484,6 +520,7 @@ export class StatsService {
     const data = await this.getCampaignSummary(start, end, userId);
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Campañas');
+    
     ws.columns = [
       { header: '#', key: 'idx', width: 4 },
       { header: 'Campaña', key: 'name', width: 30 },
@@ -501,10 +538,12 @@ export class StatsService {
       { header: 'Prom. intentos', key: 'avg_attempts', width: 14 },
       { header: 'Con reintento', key: 'with_retry', width: 14 },
     ];
+    
     data.forEach((row, i) => ws.addRow({ idx: i + 1, ...row }));
     ['L'].forEach(col => { ws.getColumn(col).numFmt = '0.00%'; });
     ws.getRow(1).font = { bold: true };
     ws.autoFilter = { from: 'A1', to: 'O1' };
+    
     return wb.xlsx.writeBuffer();
   }
 
@@ -543,13 +582,21 @@ export class StatsService {
 
   async getAgentLeaderboard(days = 30) {
     const performanceData = await this.getAgentPerformance(days);
+    
     if (performanceData.length === 0) {
-      return { leaderboard: [], topPerformer: null, averageCalls: 0, averageSuccessRate: 0 };
+      return { 
+        leaderboard: [], 
+        topPerformer: null, 
+        averageCalls: 0, 
+        averageSuccessRate: 0 
+      };
     }
+    
     const topPerformer = {
       ...performanceData[0],
       prediction: `Basado en su tasa de éxito del ${(performanceData[0].successrate * 100).toFixed(1)}%, ${performanceData[0].username} es el agente más efectivo.`
     };
+    
     const totalAgents = performanceData.length;
     const totalCalls = performanceData.reduce((sum, agent) => sum + agent.totalcalls, 0);
     const totalSuccessRate = performanceData.reduce((sum, agent) => sum + parseFloat(agent.successrate), 0);
@@ -557,10 +604,14 @@ export class StatsService {
     const averageSuccessRate = totalSuccessRate / totalAgents;
 
     return {
-      leaderboard: performanceData,
+      leaderboard: performanceData.slice(0, 20),
       topPerformer,
       averageCalls: averageCalls.toFixed(2),
       averageSuccessRate: (averageSuccessRate * 100).toFixed(2)
     };
+  }
+
+  clearCache(): void {
+    this.queryCache.clear();
   }
 }

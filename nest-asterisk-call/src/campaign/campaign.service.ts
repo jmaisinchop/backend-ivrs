@@ -21,10 +21,18 @@ dayjs.extend(customParseFormat);
 dayjs.extend(isBetween);
 dayjs.extend(isSameOrAfter);
 
+interface ProcessingLock {
+  timestamp: number;
+  inProgress: boolean;
+}
+
 @Injectable()
 export class CampaignService implements OnModuleInit {
-  private processingCampaigns = new Set<string>();
+  private processingCampaigns = new Map<string, ProcessingLock>();
   private readonly logger = new Logger(CampaignService.name);
+  private readonly PROCESSING_TIMEOUT = 30000;
+  private readonly MAX_CONTACTS_PER_BATCH = 20;
+  private readonly RETRY_BACKOFF_MS = 5000;
 
   constructor(
     @InjectRepository(Campaign)
@@ -37,17 +45,59 @@ export class CampaignService implements OnModuleInit {
     private readonly dashboardGateway: DashboardGateway,
   ) { }
 
-  /** * Limpieza de llamadas "zombis" al arrancar el servidor.
-   * Restablece contactos que se quedaron en CALLING por un reinicio abrupto.
-   */
   async onModuleInit() {
-    this.logger.log('Iniciando CampaignService. Buscando contactos zombis (CALLING)...');
-    const result = await this.contactRepo.update(
-      { callStatus: 'CALLING' },
-      { callStatus: 'NOT_CALLED', activeChannelId: null }
-    );
-    if (result.affected && result.affected > 0) {
-      this.logger.warn(`Se restablecieron ${result.affected} contactos zombis a estado NOT_CALLED.`);
+    this.logger.log('Iniciando CampaignService. Limpiando contactos zombis y verificando consistencia...');
+    
+    await this.contactRepo.manager.transaction(async (manager) => {
+      const zombieContacts = await manager
+        .createQueryBuilder(Contact, 'c')
+        .setLock('pessimistic_write')
+        .where('c.callStatus = :status', { status: 'CALLING' })
+        .getMany();
+
+      if (zombieContacts.length > 0) {
+        await manager
+          .createQueryBuilder()
+          .update(Contact)
+          .set({ 
+            callStatus: 'FAILED',
+            hangupCode: 'SYSTEM_RESTART',
+            hangupCause: 'Sistema reiniciado durante llamada',
+            activeChannelId: null,
+            finishedAt: new Date()
+          })
+          .where('callStatus = :status', { status: 'CALLING' })
+          .execute();
+
+        this.logger.warn(`Se marcaron ${zombieContacts.length} contactos zombis como FAILED.`);
+      }
+    });
+
+    const runningCampaigns = await this.campaignRepo.find({
+      where: { status: In(['RUNNING', 'PAUSED', 'SCHEDULED']) }
+    });
+
+    for (const campaign of runningCampaigns) {
+      await this.channelLimitService.forceRecalculateUsedChannels(campaign.createdBy);
+    }
+
+    this.logger.log('Limpieza y verificación completada.');
+  }
+
+  @Cron('*/5 * * * *')
+  async cleanupStalledProcessing() {
+    const now = Date.now();
+    const stalledCampaigns: string[] = [];
+
+    for (const [campaignId, lock] of this.processingCampaigns.entries()) {
+      if (lock.inProgress && (now - lock.timestamp) > this.PROCESSING_TIMEOUT) {
+        stalledCampaigns.push(campaignId);
+      }
+    }
+
+    if (stalledCampaigns.length > 0) {
+      this.logger.warn(`Detectados ${stalledCampaigns.length} procesamiento(s) estancado(s). Limpiando...`);
+      stalledCampaigns.forEach(id => this.processingCampaigns.delete(id));
     }
   }
 
@@ -68,13 +118,11 @@ export class CampaignService implements OnModuleInit {
     const endLocal = dayjs(endDateStr, 'DD-MM-YYYY HH:mm:ss', true);
 
     if (!startLocal.isValid() || !endLocal.isValid()) {
-      throw new Error('Fechas inválidas. Formato esperado: dd-MM-yyyy HH:mm:ss');
+      throw new BadRequestException('Fechas inválidas. Formato esperado: dd-MM-yyyy HH:mm:ss');
     }
 
-    const canAssign = await this.channelLimitService.canAssignChannels(
-      userId,
-      concurrentCalls,
-    );
+    const canAssign = await this.channelLimitService.canAssignChannels(userId, concurrentCalls);
+    
     if (!canAssign) {
       const max = await this.channelLimitService.getUserLimit(userId);
       const used = await this.channelLimitService.getUsedChannels(userId);
@@ -161,26 +209,29 @@ export class CampaignService implements OnModuleInit {
       const savedCampaign = await transactionalEntityManager.save(newCampaign);
       this.logger.log(`[DUPLICATE] Nueva campaña creada con ID ${savedCampaign.id} y estado inicial: ${status}`);
 
-      const newContacts = originalCampaign.contacts.map(contact => {
-        return transactionalEntityManager.create(Contact, {
-          name: contact.name,
-          phone: contact.phone,
-          identification: contact.identification,
-          message: contact.message,
-          campaign: savedCampaign,
-          attemptCount: 0,
-          callStatus: 'NOT_CALLED',
-          hangupCode: null,
-          hangupCause: null,
-          startedAt: null,
-          answeredAt: null,
-          finishedAt: null,
+      const batchSize = 500;
+      for (let i = 0; i < originalCampaign.contacts.length; i += batchSize) {
+        const batch = originalCampaign.contacts.slice(i, i + batchSize).map(contact => {
+          return transactionalEntityManager.create(Contact, {
+            name: contact.name,
+            phone: contact.phone,
+            identification: contact.identification,
+            message: contact.message,
+            campaign: savedCampaign,
+            attemptCount: 0,
+            callStatus: 'NOT_CALLED',
+            hangupCode: null,
+            hangupCause: null,
+            startedAt: null,
+            answeredAt: null,
+            finishedAt: null,
+          });
         });
-      });
-
-      // Guardado por lotes para optimizar si son muchos contactos
-      await transactionalEntityManager.save(newContacts);
-      this.logger.log(`[DUPLICATE] ${newContacts.length} contactos copiados y reseteados exitosamente.`);
+        
+        await transactionalEntityManager.save(batch);
+      }
+      
+      this.logger.log(`[DUPLICATE] ${originalCampaign.contacts.length} contactos copiados y reseteados exitosamente.`);
 
       return savedCampaign;
     });
@@ -240,7 +291,7 @@ export class CampaignService implements OnModuleInit {
     contacts: { name: string; phone: string; message: string, identification: string }[],
   ): Promise<Contact[]> {
     const camp = await this.campaignRepo.findOne({ where: { id: campaignId } });
-    if (!camp) throw new Error('Campaña no encontrada');
+    if (!camp) throw new NotFoundException('Campaña no encontrada');
 
     const contactEntities = contacts.map((c) =>
       this.contactRepo.create({
@@ -251,7 +302,17 @@ export class CampaignService implements OnModuleInit {
         campaign: camp,
       }),
     );
-    return this.contactRepo.save(contactEntities);
+    
+    const batchSize = 500;
+    const results: Contact[] = [];
+    
+    for (let i = 0; i < contactEntities.length; i += batchSize) {
+      const batch = contactEntities.slice(i, i + batchSize);
+      const saved = await this.contactRepo.save(batch);
+      results.push(...saved);
+    }
+    
+    return results;
   }
 
   async startCampaign(campaignId: string): Promise<string> {
@@ -265,9 +326,10 @@ export class CampaignService implements OnModuleInit {
     camp.status = 'RUNNING';
     await this.campaignRepo.save(camp);
     
-    // Disparador inicial
-    this.processCampaign(camp.id).catch((error) => {
-      this.logger.error(`Error al iniciar el procesamiento de la campaña ${camp.id} desde startCampaign: ${error.message}`, error.stack);
+    setImmediate(() => {
+      this.processCampaign(camp.id).catch((error) => {
+        this.logger.error(`Error al iniciar el procesamiento de la campaña ${camp.id}: ${error.message}`, error.stack);
+      });
     });
     
     return camp.status === 'PAUSED'
@@ -336,44 +398,45 @@ export class CampaignService implements OnModuleInit {
         this.logger.log(`Campaña ${camp.id} (${camp.name}) programada está dentro de la ventana. Cambiando a RUNNING.`);
         camp.status = 'RUNNING';
         await this.campaignRepo.save(camp);
-        this.processCampaign(camp.id); // Iniciar procesamiento
+        
+        setImmediate(() => {
+          this.processCampaign(camp.id).catch((error) => {
+            this.logger.error(`Error al procesar campaña ${camp.id}: ${error.message}`, error.stack);
+          });
+        });
       }
 
       if (camp.status === 'RUNNING') {
-        // Aseguramos que se mantenga viva
-        this.processCampaign(camp.id).catch((error) => {
-          this.logger.error(`Error al procesar campaña ${camp.id} desde checkCampaigns: ${error.message}`, error.stack);
+        setImmediate(() => {
+          this.processCampaign(camp.id).catch((error) => {
+            this.logger.error(`Error al procesar campaña ${camp.id}: ${error.message}`, error.stack);
+          });
         });
       }
     }
   }
 
-  // =================================================================================================
-  // LÓGICA CRÍTICA DE PROCESAMIENTO (OPTIMIZADA)
-  // =================================================================================================
-
   async processCampaign(campaignId: string): Promise<void> {
-    if (this.processingCampaigns.has(campaignId)) {
-      // Evitar reentrancia local excesiva
-      return;
+    const existingLock = this.processingCampaigns.get(campaignId);
+    const now = Date.now();
+
+    if (existingLock && existingLock.inProgress) {
+      if (now - existingLock.timestamp < this.PROCESSING_TIMEOUT) {
+        return;
+      }
     }
-    this.processingCampaigns.add(campaignId);
+
+    this.processingCampaigns.set(campaignId, { timestamp: now, inProgress: true });
 
     try {
       const camp = await this.campaignRepo.findOne({ where: { id: campaignId } });
 
-      if (!camp) {
+      if (!camp || camp.status !== 'RUNNING') {
         this.processingCampaigns.delete(campaignId);
         return;
       }
 
-      if (camp.status !== 'RUNNING') {
-        this.processingCampaigns.delete(campaignId);
-        return;
-      }
-
-      const now = dayjs();
-      if (now.isAfter(dayjs(camp.endDate))) {
+      if (dayjs().isAfter(dayjs(camp.endDate))) {
         camp.status = 'COMPLETED';
         await this.campaignRepo.save(camp);
         await this.channelLimitService.releaseChannels(camp.createdBy, camp.concurrentCalls);
@@ -381,86 +444,121 @@ export class CampaignService implements OnModuleInit {
         return;
       }
 
-      // Contamos las llamadas activas (CALLING). 
-      // NOTA: AMI debe mantener el estado CALLING hasta que se reciba StasisEnd o Fallo.
       const activeCalls = await this.contactRepo.count({
-        where: { campaign: { id: camp.id }, callStatus: 'CALLING' },
+        where: { 
+          campaign: { id: camp.id }, 
+          callStatus: 'CALLING',
+          activeChannelId: Not(null) as any
+        },
       });
       
-      const freeSlots = camp.concurrentCalls - activeCalls;
+      const freeSlots = Math.max(0, camp.concurrentCalls - activeCalls);
 
       if (freeSlots <= 0) {
-        // Cupo lleno, no hacemos nada.
         this.processingCampaigns.delete(campaignId);
         return;
       }
 
-      // 1. Intentar llenar slots con contactos nuevos (NOT_CALLED)
-      let filledSlots = 0;
-      if (freeSlots > 0) {
-        const newContacts = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
-          const items = await transactionalEntityManager
-            .createQueryBuilder(Contact, 'c')
-            .setLock('pessimistic_write') // Bloqueo de fila para evitar condiciones de carrera entre nodos/procesos
-            .where('c.campaignId = :campaignId', { campaignId: camp.id })
-            .andWhere('c.callStatus = :status', { status: 'NOT_CALLED' })
-            .andWhere('c.attemptCount < :maxRetries', { maxRetries: camp.maxRetries })
-            .orderBy('c.sequence', 'ASC')
-            .take(freeSlots)
-            .getMany();
+      const contactsToProcess = Math.min(freeSlots, this.MAX_CONTACTS_PER_BATCH);
+      let processedCount = 0;
 
-          for (const contact of items) {
-            contact.callStatus = 'CALLING';
-            contact.attemptCount = (contact.attemptCount || 0) + 1;
-            await transactionalEntityManager.save(contact);
-          }
-          return items;
-        });
+      const newContacts = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
+        const items = await transactionalEntityManager
+          .createQueryBuilder(Contact, 'c')
+          .setLock('pessimistic_write', undefined, ['SKIP LOCKED'])
+          .where('c.campaignId = :campaignId', { campaignId: camp.id })
+          .andWhere('c.callStatus = :status', { status: 'NOT_CALLED' })
+          .andWhere('c.attemptCount < :maxRetries', { maxRetries: camp.maxRetries })
+          .orderBy('c.sequence', 'ASC')
+          .limit(contactsToProcess)
+          .getMany();
 
-        for (const contact of newContacts) {
-          this.amiService.callWithTTS(contact.message, contact.phone, contact.id)
-            .catch(err => {
-               this.logger.error(`Error lanzando llamada a ${contact.id}: ${err.message}`);
-               // Si falla el lanzamiento, marcar como FAILED para no dejarlo pegado en CALLING
-               this.updateContactStatusById(contact.id, 'FAILED', 'ORIGINATE_ERROR', err.message);
-            });
+        for (const contact of items) {
+          contact.callStatus = 'CALLING';
+          contact.attemptCount = (contact.attemptCount || 0) + 1;
+          contact.startedAt = new Date();
         }
-        filledSlots += newContacts.length;
+        
+        if (items.length > 0) {
+          await transactionalEntityManager.save(items);
+        }
+        
+        return items;
+      });
+
+      for (const contact of newContacts) {
+        this.amiService.callWithTTS(contact.message, contact.phone, contact.id)
+          .catch(err => {
+            this.logger.error(`Error lanzando llamada a ${contact.id}: ${err.message}`);
+            this.updateContactStatusById(
+              contact.id, 
+              'FAILED', 
+              'ORIGINATE_ERROR', 
+              err.message,
+              null,
+              null,
+              new Date(),
+              true
+            );
+          });
+        processedCount++;
       }
 
-      // 2. Intentar llenar slots restantes con reintentos (FAILED)
-      const remainingSlots = freeSlots - filledSlots;
+      const remainingSlots = freeSlots - processedCount;
+      
       if (remainingSlots > 0) {
         const retryContacts = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
           const items = await transactionalEntityManager
             .createQueryBuilder(Contact, 'c')
-            .setLock('pessimistic_write')
+            .setLock('pessimistic_write', undefined, ['SKIP LOCKED'])
             .where('c.campaignId = :campaignId', { campaignId: camp.id })
             .andWhere('c.callStatus = :status', { status: 'FAILED' })
             .andWhere('c.attemptCount < :maxRetries', { maxRetries: camp.maxRetries })
-            .orderBy('c.sequence', 'ASC') // O por última fecha de intento
-            .take(remainingSlots)
+            .andWhere('c.finishedAt < :backoffTime', { 
+              backoffTime: new Date(Date.now() - this.RETRY_BACKOFF_MS) 
+            })
+            .orderBy('c.finishedAt', 'ASC')
+            .limit(Math.min(remainingSlots, this.MAX_CONTACTS_PER_BATCH - processedCount))
             .getMany();
 
           for (const contact of items) {
             contact.callStatus = 'CALLING';
             contact.attemptCount = (contact.attemptCount || 0) + 1;
-            await transactionalEntityManager.save(contact);
+            contact.startedAt = new Date();
           }
+          
+          if (items.length > 0) {
+            await transactionalEntityManager.save(items);
+          }
+          
           return items;
         });
 
         for (const contact of retryContacts) {
           this.amiService.callWithTTS(contact.message, contact.phone, contact.id)
             .catch(err => {
-                this.logger.error(`Error lanzando reintento a ${contact.id}: ${err.message}`);
-                this.updateContactStatusById(contact.id, 'FAILED', 'ORIGINATE_ERROR', err.message);
+              this.logger.error(`Error lanzando reintento a ${contact.id}: ${err.message}`);
+              this.updateContactStatusById(
+                contact.id, 
+                'FAILED', 
+                'ORIGINATE_ERROR', 
+                err.message,
+                null,
+                null,
+                new Date(),
+                true
+              );
             });
         }
       }
 
-      // Verificar si la campaña ha terminado (sin contactos pendientes y sin llamadas activas)
-      const currentlyCalling = await this.contactRepo.count({ where: { campaign: { id: camp.id }, callStatus: 'CALLING' } });
+      const currentlyCalling = await this.contactRepo.count({ 
+        where: { 
+          campaign: { id: camp.id }, 
+          callStatus: 'CALLING' 
+        } 
+      });
+      
       const processable = await this.contactRepo.count({
         where: {
           campaign: { id: camp.id },
@@ -483,11 +581,6 @@ export class CampaignService implements OnModuleInit {
     }
   }
 
-  /**
-   * Actualiza el estado del contacto.
-   * IMPORTANTE: Solo disparar processCampaign si el estado es final (SUCCESS/FAILED) 
-   * y la campaña sigue corriendo, para rellenar el hueco.
-   */
   async updateContactStatusById(
     contactId: string,
     status: string,
@@ -498,34 +591,48 @@ export class CampaignService implements OnModuleInit {
     finishedAt?: Date | null,
     clearChannelId: boolean = false,
   ): Promise<void> {
-    this.dashboardGateway.sendUpdate({ event: 'call-finished' });
+    const contact = await this.contactRepo.findOne({ 
+      where: { id: contactId }, 
+      relations: ['campaign'] 
+    });
     
-    const contact = await this.contactRepo.findOne({ where: { id: contactId }, relations: ['campaign'] });
     if (!contact) {
       return;
     }
+    
     const campaign = contact.campaign;
 
-    // Lógica opcional: Reintento inmediato si retryOnAnswer es true y la causa fue "No Contesto" (19)
     if (
       status === 'FAILED' &&
       causeNumber === '19' &&
       campaign.retryOnAnswer === true &&
       contact.attemptCount < campaign.maxRetries
     ) {
-      this.logger.log(`[${contactId}] Reintento inmediato por 'No Contesto'.`);
+      this.logger.log(`[${contactId}] Reintento inmediato por 'No Contesto' programado con backoff.`);
+      
       contact.attemptCount++;
-      // Mantenemos timestamps previos o actualizamos según lógica deseada
+      contact.callStatus = 'FAILED';
+      contact.hangupCode = causeNumber;
+      contact.hangupCause = causeMsg || null;
+      contact.finishedAt = new Date();
+      if (clearChannelId) {
+        contact.activeChannelId = null;
+      }
       await this.contactRepo.save(contact);
 
-      this.amiService.callWithTTS(contact.message, contact.phone, contact.id)
-        .catch(err => {
-          this.logger.error(`[${contact.id}] Falló reintento inmediato: ${err.message}`);
-          contact.callStatus = 'FAILED';
-          contact.hangupCause = 'Fallo reintento inmediato';
-          this.contactRepo.save(contact);
-        });
-      return; 
+      setTimeout(() => {
+        this.amiService.callWithTTS(contact.message, contact.phone, contact.id)
+          .catch(err => {
+            this.logger.error(`[${contact.id}] Falló reintento inmediato: ${err.message}`);
+            this.contactRepo.update(contact.id, {
+              callStatus: 'FAILED',
+              hangupCause: 'Fallo reintento inmediato',
+              activeChannelId: null
+            });
+          });
+      }, this.RETRY_BACKOFF_MS);
+      
+      return;
     }
 
     contact.callStatus = status;
@@ -541,17 +648,26 @@ export class CampaignService implements OnModuleInit {
     
     await this.contactRepo.save(contact);
 
-    this.logger.log(`Contacto ${contactId} -> ${status} (${causeMsg || 'N/A'}).`);
+    if (status === 'SUCCESS' || status === 'FAILED') {
+      this.dashboardGateway.sendUpdate(
+        { 
+          event: 'call-finished',
+          campaignId: campaign.id,
+          contactId: contact.id,
+          status: status
+        },
+        campaign.createdBy
+      );
+    }
 
-    // Si la llamada finalizó (liberó un canal) y la campaña corre, intentamos llenar el hueco
     if (['SUCCESS', 'FAILED'].includes(status) && contact.campaign.status === 'RUNNING') {
-      this.processCampaign(contact.campaign.id);
+      setImmediate(() => {
+        this.processCampaign(contact.campaign.id).catch((error) => {
+          this.logger.error(`Error procesando campaña ${contact.campaign.id} después de finalizar contacto: ${error.message}`);
+        });
+      });
     }
   }
-
-  // =================================================================================================
-  // MÉTODOS DE CONSULTA Y ESTADÍSTICAS (MANTENIDOS PARA COMPATIBILIDAD CON CONTROLADOR)
-  // =================================================================================================
 
   async getCampaignById(campaignId: string) {
     return this.campaignRepo.findOne({
@@ -560,10 +676,7 @@ export class CampaignService implements OnModuleInit {
     });
   }
 
-  async getAllCampaignsMinimal(
-    userId: string,
-    role: string
-  ): Promise<any[]> {
+  async getAllCampaignsMinimal(userId: string, role: string): Promise<any[]> {
     const whereClause: any = {};
     if (role === 'CALLCENTER') {
       whereClause.createdBy = userId;
@@ -632,9 +745,7 @@ export class CampaignService implements OnModuleInit {
       .getCount();
   }
 
-  async getMonthlyCallStats(
-    range = 'month',
-  ): Promise<{ month: string; llamadas: number; exitosas: number }[]> {
+  async getMonthlyCallStats(range = 'month'): Promise<{ month: string; llamadas: number; exitosas: number }[]> {
     const dateRangeCondition = this.buildRangeWhere('c."startDate"', range);
     const rawResults = await this.contactRepo.query(`
       SELECT
@@ -654,9 +765,7 @@ export class CampaignService implements OnModuleInit {
     }));
   }
 
-  async getCallStatusDistribution(
-    range = 'month',
-  ): Promise<Record<string, number>> {
+  async getCallStatusDistribution(range = 'month'): Promise<Record<string, number>> {
     const dateRangeCondition = this.buildRangeWhere('campaign."startDate"', range);
     const raw = await this.contactRepo
       .createQueryBuilder('contact')
@@ -675,12 +784,7 @@ export class CampaignService implements OnModuleInit {
     return result;
   }
 
-  async getLiveContacts(
-    campaignId: string,
-    status = 'ALL',
-    limit = 50,
-    offset = 0,
-  ) {
+  async getLiveContacts(campaignId: string, status = 'ALL', limit = 50, offset = 0) {
     let statusFilter = '';
     const params: any[] = [campaignId, limit, offset];
     
@@ -688,7 +792,6 @@ export class CampaignService implements OnModuleInit {
       if (status === 'PENDING') {
         statusFilter = `AND (c."callStatus" IS NULL OR c."callStatus" NOT IN ('SUCCESS', 'FAILED', 'CALLING'))`;
       } else {
-        // Uso de parámetro seguro
         statusFilter = `AND c."callStatus" = $4`; 
         params.push(status);
       }
@@ -758,21 +861,24 @@ export class CampaignService implements OnModuleInit {
   }
 
   async getCampaignContacts(campaignId: string) {
-    return this.contactRepo.query(
-      `
-      SELECT 
-        c.id, 
-        c.name, 
-        c.phone, 
-        c.identification,
-        c."callStatus" as status, 
-        c."attemptCount" as retries, 
-        c.message
-      FROM contact c
-      WHERE c."campaignId" = $1
-      ORDER BY c.name ASC
-      `,
-      [campaignId],
-    );
+    return this.contactRepo
+      .createQueryBuilder('c')
+      .select([
+        'c.id AS id',
+        'c.name AS name',
+        'c.phone AS phone',
+        'c.identification AS identification',
+        'c.callStatus AS status',
+        'c.attemptCount AS retries',
+        'c.message AS message'
+      ])
+      .where('c.campaignId = :campaignId', { campaignId })
+      .orderBy('c.name', 'ASC')
+      .limit(10000)
+      .getRawMany();
   }
+}
+
+function Not(arg0: null): any {
+  throw new Error('Function not implemented.');
 }

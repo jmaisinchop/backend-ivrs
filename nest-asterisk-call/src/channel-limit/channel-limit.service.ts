@@ -37,95 +37,147 @@ export class ChannelLimitService {
   }
 
   async canAssignChannels(userId: string, requested: number): Promise<boolean> {
-    const entry = await this.channelLimitRepo.findOne({ where: { user: { id: userId } } });
-    if (!entry) return false;
-    return (entry.usedChannels + requested) <= entry.maxChannels;
+    return await this.channelLimitRepo.manager.transaction(async (manager) => {
+      const entry = await manager
+        .createQueryBuilder(ChannelLimit, 'cl')
+        .setLock('pessimistic_write')
+        .where('cl.userId = :userId', { userId })
+        .getOne();
+
+      if (!entry) return false;
+      return (entry.usedChannels + requested) <= entry.maxChannels;
+    });
   }
 
-  /**
-   * Reserva canales de forma ATÓMICA.
-   * Realiza la suma directamente en la base de datos con una condición WHERE para asegurar
-   * que no se exceda el límite en condiciones de alta concurrencia.
-   */
   async reserveChannels(userId: string, amount: number): Promise<void> {
-    // Intentamos actualizar directamente solo si el nuevo valor no excede el máximo
-    const result = await this.channelLimitRepo
-      .createQueryBuilder()
-      .update(ChannelLimit)
-      .set({
-        usedChannels: () => `"usedChannels" + ${amount}`
-      })
-      .where('"userId" = :userId', { userId })
-      .andWhere('("usedChannels" + :amount) <= "maxChannels"', { amount })
-      .execute();
+    await this.channelLimitRepo.manager.transaction(async (manager) => {
+      const entry = await manager
+        .createQueryBuilder(ChannelLimit, 'cl')
+        .setLock('pessimistic_write')
+        .where('cl.userId = :userId', { userId })
+        .getOne();
 
-    if (result.affected === 0) {
-      // Si no se actualizó ninguna fila, es porque no existe el usuario o se excedería el límite
-      const limit = await this.getUserLimit(userId);
-      const used = await this.getUsedChannels(userId);
-      this.logger.warn(`Fallo al reservar ${amount} canales para ${userId}. Usados: ${used}, Max: ${limit}`);
+      if (!entry) {
+        throw new BadRequestException('No se encontró configuración de límite de canales para este usuario.');
+      }
+
+      const newUsed = entry.usedChannels + amount;
+      if (newUsed > entry.maxChannels) {
+        const available = entry.maxChannels - entry.usedChannels;
+        throw new BadRequestException(
+          `No hay suficientes canales disponibles. Disponibles: ${available}, Solicitados: ${amount}`
+        );
+      }
+
+      entry.usedChannels = newUsed;
+      await manager.save(entry);
       
-      throw new BadRequestException(
-        `No hay suficientes canales disponibles. (Max: ${limit}, Usados: ${used}, Solicitados: ${amount})`
-      );
-    }
+      this.logger.log(`Reservados ${amount} canales para usuario ${userId}. Ahora usa ${newUsed}/${entry.maxChannels}`);
+    });
   }
 
-  /**
-   * Libera canales de forma segura, evitando números negativos.
-   */
   async releaseChannels(userId: string, amount: number): Promise<void> {
-    await this.channelLimitRepo
-      .createQueryBuilder()
-      .update(ChannelLimit)
-      .set({
-        usedChannels: () => `GREATEST("usedChannels" - ${amount}, 0)` // Evita negativos
-      })
-      .where('"userId" = :userId', { userId })
-      .execute();
+    await this.channelLimitRepo.manager.transaction(async (manager) => {
+      const entry = await manager
+        .createQueryBuilder(ChannelLimit, 'cl')
+        .setLock('pessimistic_write')
+        .where('cl.userId = :userId', { userId })
+        .getOne();
+
+      if (!entry) {
+        this.logger.warn(`Intento de liberar canales para usuario inexistente: ${userId}`);
+        return;
+      }
+
+      entry.usedChannels = Math.max(0, entry.usedChannels - amount);
+      await manager.save(entry);
+      
+      this.logger.log(`Liberados ${amount} canales para usuario ${userId}. Ahora usa ${entry.usedChannels}/${entry.maxChannels}`);
+    });
   }
 
   async assignChannels(user: User, newMax: number): Promise<ChannelLimit> {
-    const sys = await this.systemRepo.findOne({ where: {} });
-    if (!sys) throw new Error('Debes configurar totalChannels primero en el sistema.');
-
-    let entry = await this.channelLimitRepo.findOne({
-      where: { user: { id: user.id } },
-    });
-
-    const { sum } = await this.channelLimitRepo
-      .createQueryBuilder('cl')
-      .select('COALESCE(SUM(cl.maxChannels),0)', 'sum')
-      .where('cl.userId != :uid', { uid: user.id })
-      .getRawOne<{ sum: string }>();
-
-    const assignedByOthers = Number(sum);
-    const available = sys.totalChannels - assignedByOthers;
-
-    if (newMax > available) {
-      throw new BadRequestException(
-        `Solo quedan ${available} canales libres de ${sys.totalChannels} en el sistema global.`
-      );
-    }
-
-    if (!entry) {
-      entry = this.channelLimitRepo.create({
-        user,
-        maxChannels: newMax,
-        usedChannels: 0,
-      });
-    } else {
-      // Permitimos cambiar el límite aunque esté en uso, pero advertimos si queda "overbooked"
-      if (entry.usedChannels > newMax) {
-        this.logger.warn(`Usuario ${user.id} tiene en uso ${entry.usedChannels}, pero su nuevo límite es ${newMax}. Se ajustará eventualmente.`);
+    return await this.channelLimitRepo.manager.transaction(async (manager) => {
+      const sys = await manager.findOne(SystemChannels, { where: {} });
+      if (!sys) {
+        throw new BadRequestException('Debes configurar totalChannels primero en el sistema.');
       }
-      entry.maxChannels = newMax;
-    }
 
-    return this.channelLimitRepo.save(entry);
+      const entry = await manager
+        .createQueryBuilder(ChannelLimit, 'cl')
+        .setLock('pessimistic_write')
+        .where('cl.userId = :userId', { userId: user.id })
+        .getOne();
+
+      const { sum } = await manager
+        .createQueryBuilder(ChannelLimit, 'cl')
+        .select('COALESCE(SUM(cl.maxChannels),0)', 'sum')
+        .where('cl.userId != :uid', { uid: user.id })
+        .getRawOne<{ sum: string }>();
+
+      const assignedByOthers = Number(sum);
+      const available = sys.totalChannels - assignedByOthers;
+
+      if (newMax > available) {
+        throw new BadRequestException(
+          `Solo quedan ${available} canales libres de ${sys.totalChannels} en el sistema global.`
+        );
+      }
+
+      if (!entry) {
+        const newEntry = manager.create(ChannelLimit, {
+          user,
+          maxChannels: newMax,
+          usedChannels: 0,
+        });
+        return manager.save(newEntry);
+      } else {
+        if (entry.usedChannels > newMax) {
+          this.logger.warn(
+            `Usuario ${user.id} tiene en uso ${entry.usedChannels}, pero su nuevo límite es ${newMax}. ` +
+            `Se requiere ajuste manual.`
+          );
+        }
+        entry.maxChannels = newMax;
+        return manager.save(entry);
+      }
+    });
   }
 
   async getAllLimits(): Promise<ChannelLimit[]> {
     return this.channelLimitRepo.find({ relations: ['user'] });
+  }
+
+  async forceRecalculateUsedChannels(userId: string): Promise<void> {
+    await this.channelLimitRepo.manager.transaction(async (manager) => {
+      const entry = await manager
+        .createQueryBuilder(ChannelLimit, 'cl')
+        .setLock('pessimistic_write')
+        .where('cl.userId = :userId', { userId })
+        .getOne();
+
+      if (!entry) {
+        this.logger.warn(`No se encontró configuración para usuario ${userId}`);
+        return;
+      }
+
+      const { sum } = await manager
+        .createQueryBuilder(Campaign, 'c')
+        .select('COALESCE(SUM(c.concurrentCalls), 0)', 'sum')
+        .where('c.createdBy = :userId', { userId })
+        .andWhere('c.status IN (:...statuses)', { statuses: ['RUNNING', 'PAUSED', 'SCHEDULED'] })
+        .getRawOne();
+
+      const actualUsed = Number(sum || 0);
+      
+      if (entry.usedChannels !== actualUsed) {
+        this.logger.warn(
+          `Inconsistencia detectada para usuario ${userId}: ` +
+          `DB reporta ${entry.usedChannels}, real es ${actualUsed}. Corrigiendo...`
+        );
+        entry.usedChannels = actualUsed;
+        await manager.save(entry);
+      }
+    });
   }
 }

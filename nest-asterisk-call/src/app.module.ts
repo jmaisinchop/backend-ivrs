@@ -14,10 +14,11 @@ import { ContactosModule } from './contactos/contactos.module';
 import { AuditModule } from './audit/audit.module';
 import { AuditSubscriber } from './audit/audit.subscriber';
 import { RequestContext } from './core/request-context.service';
-import { APP_INTERCEPTOR } from '@nestjs/core';
+import { APP_INTERCEPTOR, APP_GUARD } from '@nestjs/core';
 import { RequestContextInterceptor } from './core/request-context.interceptor';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { DashboardModule } from './dashboard/dashboard.module';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 
 @Module({
   imports: [
@@ -25,8 +26,16 @@ import { DashboardModule } from './dashboard/dashboard.module';
       isGlobal: true,
       ignoreEnvFile: process.env.NODE_ENV === 'production',
       envFilePath: '.env.dev',
-    }), AmiModule,
-    HttpModule,
+      cache: true,
+    }),
+    ThrottlerModule.forRoot([{
+      ttl: 60000,
+      limit: 100,
+    }]),
+    HttpModule.register({
+      timeout: 30000,
+      maxRedirects: 3,
+    }),
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -38,7 +47,18 @@ import { DashboardModule } from './dashboard/dashboard.module';
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_DATABASE'),
         autoLoadEntities: true,
-        synchronize: true,
+        synchronize: configService.get<string>('NODE_ENV') !== 'production',
+        logging: configService.get<string>('NODE_ENV') === 'development' ? ['error', 'warn'] : false,
+        maxQueryExecutionTime: 5000,
+        extra: {
+          max: 20,
+          min: 5,
+          idleTimeoutMillis: 30000,
+          connectionTimeoutMillis: 10000,
+          statement_timeout: 30000,
+          query_timeout: 30000,
+        },
+        poolSize: 20,
       }),
     }),
     TypeOrmModule.forRootAsync({
@@ -52,9 +72,20 @@ import { DashboardModule } from './dashboard/dashboard.module';
         username: configService.get<string>('DB_CONTACTOS_USERNAME'),
         password: configService.get<string>('DB_CONTACTOS_PASSWORD'),
         database: configService.get<string>('DB_CONTACTOS_DATABASE'),
+        logging: false,
+        extra: {
+          max: 10,
+          min: 2,
+          idleTimeoutMillis: 30000,
+          connectionTimeoutMillis: 10000,
+          statement_timeout: 30000,
+          query_timeout: 30000,
+        },
+        poolSize: 10,
       }),
     }),
     ScheduleModule.forRoot(),
+    AmiModule,
     CampaignModule,
     UserModule,
     AuthModule,
@@ -72,6 +103,10 @@ import { DashboardModule } from './dashboard/dashboard.module';
     {
       provide: APP_INTERCEPTOR,
       useClass: RequestContextInterceptor,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
     },
   ],
 })
