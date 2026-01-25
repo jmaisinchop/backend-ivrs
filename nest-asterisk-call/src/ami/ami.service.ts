@@ -129,7 +129,7 @@ export class AmiService implements OnModuleInit {
         this.handleStasisEnd(event, channel);
       });
 
-      await this.ari.start('stasis-app');
+      await this.ari.start('stasis-app-test');
       this.logger.log('Conectado a ARI exitosamente');
       this.reconnecting = false;
     } catch (err: any) {
@@ -247,7 +247,7 @@ export class AmiService implements OnModuleInit {
         try {
           const snoopChannel = await this.ari.channels.snoopChannel({
             channelId: channelToSpyId, 
-            app: 'stasis-app', 
+            app: 'stasis-app-test', 
             spy: 'both',
           });
           
@@ -300,7 +300,7 @@ export class AmiService implements OnModuleInit {
         await this.ari.channels.originate({
           endpoint: `Local/${supervisorExtension}@from-internal`,
           callerId: 'Supervisor',
-          app: 'stasis-app',
+          app: 'stasis-app-test',
           variables: { 'SPY_LEG': 'true', 'SPY_MASTER_ID': callId },
         });
       } catch (err: any) {
@@ -445,7 +445,7 @@ export class AmiService implements OnModuleInit {
 
       this.ari.channels.originate({
         endpoint: `SIP/${trunk}/${phone}`,
-        app: 'stasis-app',
+        app: 'stasis-app-test',
         callerId: `IVR-${callId}`,
         timeout: 45,
         channelId: callId,

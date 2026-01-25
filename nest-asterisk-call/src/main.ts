@@ -9,10 +9,13 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     logger: ['error', 'warn', 'log'],
     cors: false,
+    // Si alguna vez necesitas el rawBody para webhooks (como Stripe),
+    // se habilita aquí, NO con un middleware manual:
+    // rawBody: true, 
   });
 
   const configService = app.get(ConfigService);
-  const port = configService.get<number>('PORT') || 3000;
+  const port = configService.get<number>('PORT') || 3001;
 
   app.use(helmet({
     contentSecurityPolicy: {
@@ -39,14 +42,8 @@ async function bootstrap() {
     maxAge: 3600,
   });
 
-  app.use((req, res, next) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => {
-      (req as any).rawBody = Buffer.concat(chunks);
-      next();
-    });
-  });
+  // ❌ BLOQUE ELIMINADO: Aquí estaba el middleware que rompía el stream.
+  // NestJS manejará el body parsing automáticamente.
 
   app.useGlobalPipes(
     new ValidationPipe({
@@ -72,18 +69,6 @@ async function bootstrap() {
   app.setGlobalPrefix('api');
 
   app.enableShutdownHooks();
-
-  process.on('SIGTERM', async () => {
-    console.log('SIGTERM signal received: closing HTTP server');
-    await app.close();
-    process.exit(0);
-  });
-
-  process.on('SIGINT', async () => {
-    console.log('SIGINT signal received: closing HTTP server');
-    await app.close();
-    process.exit(0);
-  });
 
   process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason);
