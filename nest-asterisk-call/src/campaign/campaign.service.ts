@@ -1,6 +1,6 @@
 import { Injectable, forwardRef, Inject, BadRequestException, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In, LessThan, EntityManager } from 'typeorm';
+import { Repository, In, LessThan, EntityManager, Not, IsNull } from 'typeorm';
 import { Cron } from '@nestjs/schedule';
 import { UpdateCampaignDto } from './dto/update-campaign.dto';
 
@@ -448,7 +448,7 @@ export class CampaignService implements OnModuleInit {
         where: { 
           campaign: { id: camp.id }, 
           callStatus: 'CALLING',
-          activeChannelId: Not(null) as any
+          activeChannelId: Not(IsNull())
         },
       });
       
@@ -465,7 +465,8 @@ export class CampaignService implements OnModuleInit {
       const newContacts = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
         const items = await transactionalEntityManager
           .createQueryBuilder(Contact, 'c')
-          .setLock('pessimistic_write', undefined, ['SKIP LOCKED'])
+          .setLock('pessimistic_write') // Solo modo de bloqueo
+          .setOnLocked('skip_locked')   // Configuración SKIP LOCKED por separado
           .where('c.campaignId = :campaignId', { campaignId: camp.id })
           .andWhere('c.callStatus = :status', { status: 'NOT_CALLED' })
           .andWhere('c.attemptCount < :maxRetries', { maxRetries: camp.maxRetries })
@@ -510,7 +511,8 @@ export class CampaignService implements OnModuleInit {
         const retryContacts = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
           const items = await transactionalEntityManager
             .createQueryBuilder(Contact, 'c')
-            .setLock('pessimistic_write', undefined, ['SKIP LOCKED'])
+            .setLock('pessimistic_write') // Solo modo de bloqueo
+            .setOnLocked('skip_locked')   // Configuración SKIP LOCKED por separado
             .where('c.campaignId = :campaignId', { campaignId: camp.id })
             .andWhere('c.callStatus = :status', { status: 'FAILED' })
             .andWhere('c.attemptCount < :maxRetries', { maxRetries: camp.maxRetries })
@@ -877,8 +879,4 @@ export class CampaignService implements OnModuleInit {
       .limit(10000)
       .getRawMany();
   }
-}
-
-function Not(arg0: null): any {
-  throw new Error('Function not implemented.');
 }
