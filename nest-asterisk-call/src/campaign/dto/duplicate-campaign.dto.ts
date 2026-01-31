@@ -22,7 +22,8 @@ export class DuplicateCampaignDto {
     concurrentCalls: number;
 
     @IsString()
-    message: string;
+    @IsOptional()
+    message?: string;
 
     @IsBoolean()
     @IsOptional()

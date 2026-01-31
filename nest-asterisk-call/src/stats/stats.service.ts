@@ -46,11 +46,11 @@ export class StatsService {
 
   private async getIvrMetricsForPeriod(days: number, offsetDays: number, userId?: string) {
     const cacheKey = `ivr_metrics_${days}_${offsetDays}_${userId || 'all'}`;
-    
+
     return this.getCachedOrExecute(cacheKey, async () => {
       const params: any[] = [days, offsetDays];
       let userFilter = '';
-      
+
       if (userId) {
         userFilter = `AND c."createdBy" = $3`;
         params.push(userId);
@@ -148,7 +148,7 @@ export class StatsService {
 
   getCallStatusDistribution(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; 
+    const params: (number | string)[] = [days];
     if (userId) params.push(userId);
 
     return this.contactRepo.query(
@@ -164,7 +164,7 @@ export class StatsService {
 
   getAttemptsEfficiency(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; 
+    const params: (number | string)[] = [days];
     if (userId) params.push(userId);
 
     return this.contactRepo.query(
@@ -183,7 +183,7 @@ export class StatsService {
 
   async getRetryRate(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; 
+    const params: (number | string)[] = [days];
     if (userId) params.push(userId);
 
     const [row] = await this.contactRepo.query(
@@ -200,7 +200,7 @@ export class StatsService {
 
   getFailureTrend(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; 
+    const params: (number | string)[] = [days];
     if (userId) params.push(userId);
 
     return this.contactRepo.query(
@@ -217,7 +217,7 @@ export class StatsService {
 
   getSuccessRateByHour(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; 
+    const params: (number | string)[] = [days];
     if (userId) params.push(userId);
 
     return this.contactRepo.query(
@@ -236,7 +236,7 @@ export class StatsService {
 
   getTopBusyHours(limit = 5, days = 30, userId?: string) {
     const extra = userId ? this.createdBy(3) : '';
-    const params: (number | string)[] = [Math.min(limit, 24), days]; 
+    const params: (number | string)[] = [Math.min(limit, 24), days];
     if (userId) params.push(userId);
 
     return this.contactRepo.query(
@@ -251,7 +251,7 @@ export class StatsService {
 
   async getAvgCallsPerCampaign(days = 30, userId?: string) {
     const extra = userId ? this.createdBy(2) : '';
-    const params: (number | string)[] = [days]; 
+    const params: (number | string)[] = [days];
     if (userId) params.push(userId);
 
     const [{ avg }] = await this.contactRepo.query(
@@ -289,10 +289,10 @@ export class StatsService {
 
   async getChannelPressure(userId?: string) {
     const cacheKey = `channel_pressure_${userId || 'all'}`;
-    
+
     return this.getCachedOrExecute(cacheKey, async () => {
-      const sql = userId 
-      ? `
+      const sql = userId
+        ? `
         SELECT
           cl."maxChannels"  AS total,
           COALESCE(SUM(c."concurrentCalls"), 0) AS used,
@@ -307,7 +307,7 @@ export class StatsService {
         WHERE cl."userId"::text = $1
         GROUP BY cl."maxChannels";
       `
-      : `
+        : `
         SELECT
           SUM(cl."maxChannels")                  AS total,
           COALESCE(SUM(c."concurrentCalls"), 0)   AS used,
@@ -321,12 +321,12 @@ export class StatsService {
           ON c."createdBy" = cl."userId"::text
          AND c.status IN ('SCHEDULED','RUNNING','PAUSED');
       `;
-      
+
       const params = userId ? [userId] : [];
       const [row] = await this.limitRepo.query(sql, params);
-      
+
       if (!row) return { total: 0, used: 0, pressure: 0 };
-      
+
       return {
         total: Number(row.total),
         used: Number(row.used),
@@ -358,7 +358,7 @@ export class StatsService {
 
   getAgentPerformance(days = 30, userId?: string) {
     const userFilter = userId ? `WHERE u.id = $2::uuid` : '';
-    const params: (number | string)[] = [days]; 
+    const params: (number | string)[] = [days];
     if (userId) params.push(userId);
 
     return this.contactRepo.query(
@@ -382,7 +382,7 @@ export class StatsService {
 
   getTopHangupCauses(limit = 5, days = 30, userId?: string) {
     const extra = userId ? this.createdBy(3) : '';
-    const params: (number | string)[] = [Math.min(limit, 50), days]; 
+    const params: (number | string)[] = [Math.min(limit, 50), days];
     if (userId) params.push(userId);
 
     return this.contactRepo.query(
@@ -418,7 +418,7 @@ export class StatsService {
 
   async getOverview(userId?: string) {
     const cacheKey = `overview_${userId || 'all'}`;
-    
+
     return this.getCachedOrExecute(cacheKey, async () => {
       const extra = userId ? `WHERE c."createdBy" = $1` : '';
       const params = userId ? [userId] : [];
@@ -490,7 +490,8 @@ export class StatsService {
       `SELECT c.id, c.name, c.status,
           TO_CHAR(c."startDate", 'YYYY-MM-DD') AS start,
           TO_CHAR(c."endDate", 'YYYY-MM-DD') AS "end",
-          ROUND(EXTRACT(EPOCH FROM (c."endDate" - c."startDate"))/3600,2) AS hours,
+          -- CORRECCIÓN AQUÍ: Convertimos el cálculo a ::numeric antes de redondear
+          ROUND((EXTRACT(EPOCH FROM (c."endDate" - c."startDate"))/3600)::numeric, 2) AS hours,
           COALESCE(u.username,'-') AS created_by,
           COUNT(ct.id)::INT AS total,
           COUNT(*) FILTER (WHERE ct."callStatus"='SUCCESS')::INT AS success,
@@ -500,9 +501,9 @@ export class StatsService {
           ROUND(AVG(ct."attemptCount")::NUMERIC,2) AS avg_attempts,
           COUNT(*) FILTER (WHERE ct."attemptCount" > 1)::INT AS with_retry,
           ROUND(
-            CASE WHEN COUNT(*) = 0 THEN 0
+            (CASE WHEN COUNT(*) = 0 THEN 0
                  ELSE COUNT(*) FILTER (WHERE ct."callStatus"='SUCCESS')::NUMERIC / COUNT(*)
-            END, 4
+            END)::numeric, 4
           ) AS success_rate
         FROM campaign c
         LEFT JOIN contact ct ON ct."campaignId" = c.id
@@ -520,7 +521,7 @@ export class StatsService {
     const data = await this.getCampaignSummary(start, end, userId);
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Campañas');
-    
+
     ws.columns = [
       { header: '#', key: 'idx', width: 4 },
       { header: 'Campaña', key: 'name', width: 30 },
@@ -538,12 +539,12 @@ export class StatsService {
       { header: 'Prom. intentos', key: 'avg_attempts', width: 14 },
       { header: 'Con reintento', key: 'with_retry', width: 14 },
     ];
-    
+
     data.forEach((row, i) => ws.addRow({ idx: i + 1, ...row }));
     ['L'].forEach(col => { ws.getColumn(col).numFmt = '0.00%'; });
     ws.getRow(1).font = { bold: true };
     ws.autoFilter = { from: 'A1', to: 'O1' };
-    
+
     return wb.xlsx.writeBuffer();
   }
 
@@ -582,21 +583,21 @@ export class StatsService {
 
   async getAgentLeaderboard(days = 30) {
     const performanceData = await this.getAgentPerformance(days);
-    
+
     if (performanceData.length === 0) {
-      return { 
-        leaderboard: [], 
-        topPerformer: null, 
-        averageCalls: 0, 
-        averageSuccessRate: 0 
+      return {
+        leaderboard: [],
+        topPerformer: null,
+        averageCalls: 0,
+        averageSuccessRate: 0
       };
     }
-    
+
     const topPerformer = {
       ...performanceData[0],
       prediction: `Basado en su tasa de éxito del ${(performanceData[0].successrate * 100).toFixed(1)}%, ${performanceData[0].username} es el agente más efectivo.`
     };
-    
+
     const totalAgents = performanceData.length;
     const totalCalls = performanceData.reduce((sum, agent) => sum + agent.totalcalls, 0);
     const totalSuccessRate = performanceData.reduce((sum, agent) => sum + parseFloat(agent.successrate), 0);

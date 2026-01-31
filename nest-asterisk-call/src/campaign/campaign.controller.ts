@@ -7,10 +7,10 @@ import { CreateCampaignDto } from './dto/create-campaign.dto';
 import { PermissionGuard, RequirePermission } from '../auth/permissions.guard';
 import { Roles } from 'src/auth/roles.decorator';
 import { RolesGuard } from 'src/auth/roles.guard';
-import { AmiService } from '../ami/ami.service'; 
+import { AmiService } from '../ami/ami.service';
 
 
-@UseGuards(AuthGuard('jwt'), PermissionGuard) 
+@UseGuards(AuthGuard('jwt'), PermissionGuard)
 @RequirePermission('ivrs')
 @Controller('campaigns')
 export class CampaignController {
@@ -21,7 +21,7 @@ export class CampaignController {
   @Post()
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   async createCampaign(
-    @Body() createCampaignDto: CreateCampaignDto, 
+    @Body() createCampaignDto: CreateCampaignDto,
     @Req() req
   ) {
     const userId = req.user.id;
@@ -82,11 +82,23 @@ export class CampaignController {
     return camp;
   }
 
-  @Get('all/minimal')
-  async getAllCampaigns(@Req() req) {
-    const userId = req.user.id;
+@Get('all/minimal')
+  async getAllCampaigns(
+    @Req() req,
+    @Query('page') page = 1,
+    @Query('limit') limit = 10,
+    @Query('search') search = '',
+    @Query('status') status = 'ALL',
+  ) {
+    const userId = req.user.userId || req.user.id; 
     const role = req.user.role;
-    return this.campaignService.getAllCampaignsMinimal(userId, role);
+    
+    return this.campaignService.getAllCampaignsMinimal(userId, role, {
+        page: +page,
+        limit: +limit,
+        search,
+        status
+    });
   }
 
 
@@ -157,7 +169,7 @@ export class CampaignController {
   }
 
   @Patch(':id')
-  @UsePipes(new ValidationPipe({ whitelist: true })) 
+  @UsePipes(new ValidationPipe({ whitelist: true }))
   async updateCampaign(
     @Param('id') campaignId: string,
     @Body() updateDto: UpdateCampaignDto,
