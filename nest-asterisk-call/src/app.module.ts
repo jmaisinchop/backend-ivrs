@@ -19,6 +19,7 @@ import { RequestContextInterceptor } from './core/request-context.interceptor';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { DashboardModule } from './dashboard/dashboard.module';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { PostCallModule } from './post-call/post-call.module';
 
 @Module({
   imports: [
@@ -94,6 +95,7 @@ import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
     ContactosModule,
     AuditModule,
     DashboardModule,
+    PostCallModule,
   ],
   controllers: [AppController],
   providers: [

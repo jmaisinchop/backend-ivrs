@@ -13,6 +13,8 @@ import AriClient from 'ari-client';
 import { CampaignService } from '../campaign/campaign.service';
 import { ConfigService } from '@nestjs/config';
 import { DashboardGateway } from 'src/dashboard/dashboard.gateway';
+import { PostCallService } from '../post-call/post-call.service';
+import { AgentService } from '../post-call/agent.service';
 import { EventEmitter } from 'events';
 
 const WS_RETRY_MS = 3000;
@@ -33,6 +35,7 @@ const CAUSES: Record<number | string, string> = {
 
 interface CallFlags { 
   contactId: string; 
+  campaignId: string;   // ← AGREGADO: se guarda al originar la llamada
   rang: boolean; 
   up: boolean; 
   createdAt: number;
@@ -63,6 +66,10 @@ export class AmiService implements OnModuleInit {
     private readonly campaigns: CampaignService,
     private readonly configService: ConfigService,
     private readonly dashboardGateway: DashboardGateway,
+    @Inject(forwardRef(() => PostCallService))
+    private readonly postCallService: PostCallService,
+    @Inject(forwardRef(() => AgentService))
+    private readonly agentService: AgentService,
   ) {
     this.ariEvents.setMaxListeners(MAX_EVENT_LISTENERS);
   }
@@ -173,8 +180,32 @@ export class AmiService implements OnModuleInit {
     
     const varResult = await channel.getChannelVar({ variable: 'SPY_LEG' }).catch(() => ({value: null}));
     const isSpyLeg = varResult.value === 'true';
+
+    // Verificar si es una llamada al asesor (transferencia post-call)
+    const agentLegResult = await channel.getChannelVar({ variable: 'AGENT_LEG' }).catch(() => ({value: null}));
+    const isAgentLeg = agentLegResult.value === 'true';
     
-    if (isSpyLeg) {
+    if (isAgentLeg) {
+      // Es la llamada originada al asesor para el bridge
+      this.logger.log(`[StasisStart] Canal ${channel.id} es llamada a asesor. Contestando...`);
+      try {
+        await channel.answer();
+
+        const masterIdResult = await channel.getChannelVar({ variable: 'AGENT_MASTER_ID' });
+        const contactId = masterIdResult.value;
+
+        if (contactId) {
+          this.logger.log(`[StasisStart] Emitting 'agent_answered' para contacto ${contactId}`);
+          this.ariEvents.emit(`agent_answered_${contactId}`, { agentChannel: channel });
+        }
+      } catch (err: any) {
+        this.logger.error(`[StasisStart] Error asesor ${channel.id}: ${err.message}`);
+        const m = await channel.getChannelVar({ variable: 'AGENT_MASTER_ID' }).catch(() => ({value: null}));
+        if (m.value) {
+          this.ariEvents.emit(`agent_failed_${m.value}`, new Error('Fallo al contestar asesor.'));
+        }
+      }
+    } else if (isSpyLeg) {
       this.logger.log(`[StasisStart] El canal ${channel.id} es una llamada para el supervisor. Contestando...`);
       try {
         await channel.answer();
@@ -207,8 +238,12 @@ export class AmiService implements OnModuleInit {
                 return;
               }
               playback.once('PlaybackFinished', () => {
-                this.logger.log(`[StasisStart-Playback] Finalizado. Colgando.`);
-                channel.hangup().catch(() => {});
+                // ─── Delegar a PostCallService pasando campaignId desde flags ──
+                this.logger.log(`[StasisStart-Playback] TTS finalizado. Delegando a PostCallService.`);
+                this.postCallService.handlePostCall(channel, f.contactId, f.campaignId).catch((err2: any) => {
+                  this.logger.error(`[StasisStart-Playback] Error en handlePostCall: ${err2.message}`);
+                  channel.hangup().catch(() => {});
+                });
               });
             });
           } else {
@@ -218,6 +253,109 @@ export class AmiService implements OnModuleInit {
         }
       }
     }
+  }
+
+  // ─── BRIDGE CLIENTE → ASESOR (transferencia post-call) ───────────────
+
+  public async transferAgentBridge(contactId: string, agentExtension: string): Promise<void> {
+    const connectAt = Date.now();
+    this.logger.log(`[AGENT-BRIDGE] Iniciando bridge contacto ${contactId} → asesor ${agentExtension}`);
+
+    // Buscar el canal activo del contacto
+    const contact = await this.campaigns.findContactById(contactId);
+    if (!contact || !contact.activeChannelId) {
+      throw new Error('Canal del contacto no activo.');
+    }
+    const clientChannelId = contact.activeChannelId;
+
+    return new Promise<void>(async (resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        cleanup();
+        // Si timeout, notificar al AgentService que falló
+        this.logger.warn(`[AGENT-BRIDGE] Timeout esperando asesor para contacto ${contactId}`);
+        reject(new Error('Timeout esperando que el asesor conteste'));
+      }, 30000);
+
+      const cleanup = () => {
+        clearTimeout(timeoutId);
+        this.ariEvents.removeAllListeners(`agent_answered_${contactId}`);
+        this.ariEvents.removeAllListeners(`agent_failed_${contactId}`);
+      };
+
+      this.ariEvents.once(`agent_answered_${contactId}`, async ({ agentChannel }) => {
+        cleanup();
+        try {
+          // Crear bridge de mixing entre cliente y asesor
+          const bridge = this.ari.Bridge();
+          await bridge.create({ type: 'mixing' });
+
+          // Obtener referencia al canal del cliente
+          const clientChannel = await this.ari.channels.get({ channelId: clientChannelId });
+          await bridge.addChannel({ channel: [clientChannel.id, agentChannel.id] });
+
+          this.logger.log(`[AGENT-BRIDGE] Bridge activo. Contacto ${contactId} ↔ Asesor ${agentExtension}`);
+
+          // Emitir al asesor que ya está conectado con datos del contacto
+          const campaignId = contact.campaign?.id || null;
+          this.dashboardGateway.sendUpdate(
+            {
+              event: 'agent-call-connected',
+              contactId,
+              campaignId,
+              contactName: contact.name,
+              contactPhone: contact.phone,
+              contactIdentification: contact.identification,
+            },
+            // El userId del asesor lo buscamos por extensión — se pasa desde AgentService
+          );
+
+          const durationStart = Date.now();
+
+          // Cuando cualquiera cuelga, destruir bridge y notificar
+          const onEnd = async () => {
+            const durationSeconds = Math.floor((Date.now() - durationStart) / 1000);
+            this.logger.log(`[AGENT-BRIDGE] Finalizado. Duración: ${durationSeconds}s`);
+            agentChannel.hangup().catch(() => {});
+            clientChannel.hangup().catch(() => {});
+            bridge.destroy().catch(() => {});
+
+            // Notificar a AgentService que la llamada terminó
+            // El agentUserId lo resolvemos buscando por extensión en AgentService
+            const agents = this.agentService.getAgentsSnapshot();
+            const agent = agents.find(a => a.extension === agentExtension);
+            if (agent) {
+              await this.agentService.onAgentCallFinished(contactId, campaignId, agent.userId, durationSeconds);
+            }
+          };
+
+          agentChannel.once('StasisEnd', onEnd);
+          clientChannel.once('StasisEnd', onEnd);
+
+          resolve();
+        } catch (err: any) {
+          this.logger.error(`[AGENT-BRIDGE] Error bridge: ${err.message}`);
+          agentChannel.hangup().catch(() => {});
+          reject(new Error('Error al conectar bridge cliente-asesor.'));
+        }
+      });
+
+      this.ariEvents.once(`agent_failed_${contactId}`, (err: Error) => {
+        cleanup();
+        reject(err);
+      });
+
+      // Originar llamada al asesor via extensión interna
+      try {
+        await this.ari.channels.originate({
+          endpoint: `Local/${agentExtension}@from-internal`,
+          callerId: `Cliente-${contactId}`,
+          app: 'stasis-app',
+          variables: { 'AGENT_LEG': 'true', 'AGENT_MASTER_ID': contactId },
+        });
+      } catch (err: any) {
+        this.ariEvents.emit(`agent_failed_${contactId}`, err);
+      }
+    });
   }
   
   public async spyCall(contactId: string, supervisorExtension: string): Promise<{ message: string }> {
@@ -311,6 +449,10 @@ export class AmiService implements OnModuleInit {
 
   public async callWithTTS(text: string, phone: string, contactId: string): Promise<void> {
     const initialCallAttemptStartedAt = new Date();
+
+    // ─── AGREGADO: buscar campaignId del contacto antes de originar ───
+    const contact = await this.campaigns.findContactById(contactId);
+    const campaignId = contact?.campaign?.id || '';
     
     const audio = await this.generateTts(text).catch((err) => {
       this.logger.error(`Error generando TTS para contacto ${contactId}: ${err.message}`);
@@ -336,7 +478,8 @@ export class AmiService implements OnModuleInit {
     for (const trunk of this.trunks) {
       let attemptSpecificStartedAt = new Date();
       try {
-        final = await this.tryCallRaw(contactId, trunk, phone, audio, attemptSpecificStartedAt);
+        // ─── AGREGADO: pasar campaignId a tryCallRaw ───
+        final = await this.tryCallRaw(contactId, campaignId, trunk, phone, audio, attemptSpecificStartedAt);
       } catch (e: any) {
         this.logger.error(`[${contactId}] Error tryCallRaw ${trunk}: ${e.message}`);
         final = {
@@ -381,7 +524,8 @@ export class AmiService implements OnModuleInit {
   }
 
   private async tryCallRaw(
-    contactId: string, 
+    contactId: string,
+    campaignId: string,   // ─── AGREGADO ───
     trunk: string, 
     phone: string, 
     audio: string,
@@ -389,8 +533,10 @@ export class AmiService implements OnModuleInit {
   ): Promise<CallResult> {
     const callId = uuidv4();
     
+    // ─── AGREGADO: guardar campaignId en flags ───
     this.flags.set(callId, { 
       contactId, 
+      campaignId,
       rang: false, 
       up: false,
       createdAt: Date.now()
