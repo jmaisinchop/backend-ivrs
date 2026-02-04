@@ -48,6 +48,7 @@ import { PostCallModule } from './post-call/post-call.module';
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_DATABASE'),
         autoLoadEntities: true,
+        timezone: 'America/Guayaquil',
         synchronize: configService.get<string>('NODE_ENV') !== 'production',
         logging: configService.get<string>('NODE_ENV') === 'development' ? ['error', 'warn'] : false,
         maxQueryExecutionTime: 5000,

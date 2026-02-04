@@ -1,14 +1,28 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { DashboardGateway } from './dashboard.gateway';
 import { JwtModule } from '@nestjs/jwt';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { PostCallModule } from '../post-call/post-call.module';
 
 @Module({
   imports: [
-    JwtModule.register({}),
+    // JWT necesita ConfigService para leer JWT_SECRET del .env
+    JwtModule.registerAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => ({
+        secret: configService.get('JWT_SECRET'),
+        signOptions: { expiresIn: '7d' },
+      }),
+    }),
+    
     ConfigModule,
+    
+    // PostCallModule exporta AgentService que DashboardGateway necesita
+    // forwardRef resuelve la dependencia circular
+    forwardRef(() => PostCallModule),
   ],
   providers: [DashboardGateway],
-  exports: [DashboardGateway], 
+  exports: [DashboardGateway],
 })
 export class DashboardModule {}

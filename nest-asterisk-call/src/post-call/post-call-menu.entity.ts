@@ -6,7 +6,6 @@ export class PostCallMenu {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  // 1:1 con campaña. Solo las campañas que lo activen tienen registro aquí.
   @OneToOne(() => Campaign, { onDelete: 'CASCADE' })
   @JoinColumn()
   campaign: Campaign;
@@ -15,18 +14,36 @@ export class PostCallMenu {
   @Column({ default: false })
   active: boolean;
 
-  // Texto del saludo que se genera como TTS al final de la llamada automática.
-  // Ejemplo: "Gracias por su llamada. Para hablar con un asesor marque 1. Para registrar un compromiso de pago marque 2."
-  // Si está vacío, se usa el saludo por defecto del sistema.
+  // ─── SALUDO PRINCIPAL ────────────────────────────────────────────────────
+  // Texto completo que se reproduce al inicio del menú.
+  // Ejemplo: "Gracias por su llamada. Para hablar con un asesor marque 1. Para registrar un compromiso marque 2."
+  // Si está vacío, se auto-genera con buildDefaultGreeting()
   @Column({ type: 'text', nullable: true })
   greeting: string | null;
 
-  // Opciones disponibles en el menú.
-  // Cada opción tiene: tecla DTMF, tipo de acción, texto TTS.
-  // Ejemplo: [{ key: '1', action: 'transfer_agent', text: 'Para hablar con un asesor marque 1' },
-  //           { key: '2', action: 'payment_commitment', text: 'Para registrar un compromiso marque 2' }]
+  // ─── OPCIONES DEL MENÚ ───────────────────────────────────────────────────
+  // Cada opción puede tener steps (preguntas encadenadas).
+  // El array puede tener 1, 2 o más opciones.
   @Column({ type: 'jsonb', default: [] })
   options: PostCallMenuOption[];
+
+  // ─── MENSAJES CONFIGURABLES ──────────────────────────────────────────────
+  // Mensaje que se reproduce cuando el cliente está en cola de espera.
+  // Soporta placeholder {position} que se reemplaza en runtime.
+  // Ejemplo: "Usted es el número {position} en la fila. Por favor espere."
+  @Column({ type: 'text', nullable: true })
+  queueMessage: string | null;
+
+  // Mensaje de confirmación exitosa (ej: cuando se guarda un compromiso)
+  // Soporta placeholder {day} para el día capturado.
+  // Ejemplo: "Su compromiso ha sido registrado para el día {day}. Gracias por su llamada."
+  @Column({ type: 'text', nullable: true })
+  confirmationMessage: string | null;
+
+  // Mensaje de error genérico (cuando el cliente ingresa algo inválido en el menú principal)
+  // Ejemplo: "Entrada no válida. Por favor intente nuevamente."
+  @Column({ type: 'text', nullable: true })
+  errorMessage: string | null;
 
   @CreateDateColumn()
   createdAt: Date;
@@ -35,10 +52,34 @@ export class PostCallMenu {
   updatedAt: Date;
 }
 
+// ─── TIPOS DE ACCIONES DISPONIBLES ──────────────────────────────────────────
 export type PostCallMenuOptionAction = 'transfer_agent' | 'payment_commitment';
 
+// ─── TIPOS DE CAPTURA DTMF ──────────────────────────────────────────────────
+// single_digit: captura UNA sola tecla inmediatamente
+// numeric:      captura múltiples dígitos numéricos (se detiene por timeout entre dígitos o al llegar a maxDigits)
+export type DtmfCaptureType = 'single_digit' | 'numeric';
+
+// ─── REGLAS DE VALIDACIÓN DISPONIBLES ───────────────────────────────────────
+// day_1_28:       número entre 1 y 28 (para días de pago)
+// day_laborable:  día entre 1-28 que no cae en fin de semana (se calcula runtime)
+// none:           sin validación, acepta cualquier entrada
+export type ValidationRule = 'day_1_28' | 'day_laborable' | 'none';
+
+// ─── PASO DE PREGUNTA DENTRO DE UNA OPCIÓN ──────────────────────────────────
+export interface PostCallMenuStep {
+  prompt: string;                 // Texto TTS que reproduce antes de esperar input
+  capture: DtmfCaptureType;       // Tipo de captura
+  maxDigits?: number;             // Solo aplica a 'numeric'. Ej: 2 para un día (01-28)
+  validation: ValidationRule;     // Qué validar con la respuesta
+  errorMessage: string;           // Qué decir si la validación falla
+  saveAs: string;                 // Identificador de qué dato captura. Ej: 'commitmentDay'
+}
+
+// ─── OPCIÓN DEL MENÚ ────────────────────────────────────────────────────────
 export interface PostCallMenuOption {
   key: string;                        // Tecla DTMF: '1', '2', etc.
-  action: PostCallMenuOptionAction;   // Qué hace al presionar esa tecla
-  text: string;                       // Texto que se anuncia para esa opción (parte del saludo)
+  action: PostCallMenuOptionAction;   // Qué tipo de flujo se ejecuta al presionar esta tecla
+  text: string;                       // Texto que se anuncia para esta opción (parte del greeting)
+  steps: PostCallMenuStep[];          // Preguntas que se hacen después de presionar la tecla. Puede estar vacío (ej: transfer_agent no tiene preguntas)
 }

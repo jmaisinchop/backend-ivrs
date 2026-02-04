@@ -6,7 +6,10 @@ import { ConfigModule } from '@nestjs/config';
 import { PostCallMenu } from './post-call-menu.entity';
 import { Commitment } from './commitment.entity';
 import { AgentCallEvent } from './agent-call-event.entity';
-import { User } from '../user/user.entity';                  // ← agregar
+import { AgentBreak } from './agent-break.entity';
+import { User } from '../user/user.entity';
+import { Contact } from '../campaign/contact.entity'; 
+import { Campaign } from '../campaign/campaign.entity';
 
 import { PostCallService } from './post-call.service';
 import { PostCallController } from './post-call.controller';
@@ -18,12 +21,20 @@ import { AmiModule } from '../ami/ami.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([PostCallMenu, Commitment, AgentCallEvent, User]),
+    TypeOrmModule.forFeature([
+      PostCallMenu, 
+      Commitment, 
+      AgentCallEvent,
+      AgentBreak,     // ← AGREGADO para tracking de descansos
+      User, 
+      Contact,
+      Campaign,
+    ]),
     HttpModule,
     ConfigModule,
     forwardRef(() => CampaignModule),
     forwardRef(() => AmiModule),
-    DashboardModule,
+    forwardRef(() => DashboardModule),
   ],
   providers: [PostCallService, AgentService],
   controllers: [PostCallController],

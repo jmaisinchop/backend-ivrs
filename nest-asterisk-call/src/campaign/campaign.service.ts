@@ -465,8 +465,8 @@ export class CampaignService implements OnModuleInit {
       const newContacts = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
         const items = await transactionalEntityManager
           .createQueryBuilder(Contact, 'c')
-          .setLock('pessimistic_write') // Solo modo de bloqueo
-          .setOnLocked('skip_locked')   // Configuración SKIP LOCKED por separado
+          .setLock('pessimistic_write')
+          .setOnLocked('skip_locked')
           .where('c.campaignId = :campaignId', { campaignId: camp.id })
           .andWhere('c.callStatus = :status', { status: 'NOT_CALLED' })
           .andWhere('c.attemptCount < :maxRetries', { maxRetries: camp.maxRetries })
@@ -511,8 +511,8 @@ export class CampaignService implements OnModuleInit {
         const retryContacts = await this.contactRepo.manager.transaction(async transactionalEntityManager => {
           const items = await transactionalEntityManager
             .createQueryBuilder(Contact, 'c')
-            .setLock('pessimistic_write') // Solo modo de bloqueo
-            .setOnLocked('skip_locked')   // Configuración SKIP LOCKED por separado
+            .setLock('pessimistic_write')
+            .setOnLocked('skip_locked')
             .where('c.campaignId = :campaignId', { campaignId: camp.id })
             .andWhere('c.callStatus = :status', { status: 'FAILED' })
             .andWhere('c.attemptCount < :maxRetries', { maxRetries: camp.maxRetries })
@@ -691,7 +691,7 @@ export class CampaignService implements OnModuleInit {
         'c.endDate',
         'c.concurrentCalls',
         'c.maxRetries',
-        'c.createdBy' // Nos aseguramos de pedir createdBy para los filtros
+        'c.createdBy'
       ]);
 
     if (role !== 'ADMIN' && role !== 'SUPERVISOR') {
@@ -707,7 +707,7 @@ export class CampaignService implements OnModuleInit {
     }
 
     query
-      .orderBy('c.startDate', 'DESC') // <--- CORRECCIÓN AQUÍ (Antes era createdAt)
+      .orderBy('c.startDate', 'DESC')
       .skip(skip)
       .take(limit);
 
@@ -884,8 +884,14 @@ export class CampaignService implements OnModuleInit {
     return Math.max(1, Math.ceil(+count / limit));
   }
 
+  // ✅ CORRECCIÓN: Se agregó relations: ['campaign'] para que contact.campaign.id
+  //    esté disponible cuando se usa este método en callWithTTS (ami.service.ts).
+  //    Sin esto, campaignId llegaba como '' a los flags y el post-call menu no se reproducía.
   async findContactById(contactId: string): Promise<Contact | null> {
-    return this.contactRepo.findOne({ where: { id: contactId } });
+    return this.contactRepo.findOne({
+      where: { id: contactId },
+      relations: ['campaign'],
+    });
   }
 
   async updateContactChannelId(contactId: string, channelId: string): Promise<void> {

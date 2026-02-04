@@ -35,7 +35,7 @@ const CAUSES: Record<number | string, string> = {
 
 interface CallFlags { 
   contactId: string; 
-  campaignId: string;   // ← AGREGADO: se guarda al originar la llamada
+  campaignId: string;
   rang: boolean; 
   up: boolean; 
   createdAt: number;
@@ -238,7 +238,7 @@ export class AmiService implements OnModuleInit {
                 return;
               }
               playback.once('PlaybackFinished', () => {
-                // ─── Delegar a PostCallService pasando campaignId desde flags ──
+                // Delegar a PostCallService pasando campaignId desde flags
                 this.logger.log(`[StasisStart-Playback] TTS finalizado. Delegando a PostCallService.`);
                 this.postCallService.handlePostCall(channel, f.contactId, f.campaignId).catch((err2: any) => {
                   this.logger.error(`[StasisStart-Playback] Error en handlePostCall: ${err2.message}`);
@@ -257,9 +257,10 @@ export class AmiService implements OnModuleInit {
 
   // ─── BRIDGE CLIENTE → ASESOR (transferencia post-call) ───────────────
 
-  public async transferAgentBridge(contactId: string, agentExtension: string): Promise<void> {
+  // CORRECCIÓN: Agregado agentUserId para poder notificar al socket correcto
+  public async transferAgentBridge(contactId: string, agentExtension: string, agentUserId: string): Promise<void> {
     const connectAt = Date.now();
-    this.logger.log(`[AGENT-BRIDGE] Iniciando bridge contacto ${contactId} → asesor ${agentExtension}`);
+    this.logger.log(`[AGENT-BRIDGE] Iniciando bridge contacto ${contactId} → asesor ${agentExtension} (User: ${agentUserId})`);
 
     // Buscar el canal activo del contacto
     const contact = await this.campaigns.findContactById(contactId);
@@ -297,6 +298,8 @@ export class AmiService implements OnModuleInit {
 
           // Emitir al asesor que ya está conectado con datos del contacto
           const campaignId = contact.campaign?.id || null;
+          
+          // CORRECCIÓN: Se envía el evento al userId específico
           this.dashboardGateway.sendUpdate(
             {
               event: 'agent-call-connected',
@@ -305,8 +308,9 @@ export class AmiService implements OnModuleInit {
               contactName: contact.name,
               contactPhone: contact.phone,
               contactIdentification: contact.identification,
+              connectedAt: new Date().toISOString(), // Útil para el timer en frontend
             },
-            // El userId del asesor lo buscamos por extensión — se pasa desde AgentService
+            agentUserId // <--- ID del usuario para direccionar el socket
           );
 
           const durationStart = Date.now();
@@ -315,17 +319,14 @@ export class AmiService implements OnModuleInit {
           const onEnd = async () => {
             const durationSeconds = Math.floor((Date.now() - durationStart) / 1000);
             this.logger.log(`[AGENT-BRIDGE] Finalizado. Duración: ${durationSeconds}s`);
+            
+            // Intentar colgar canales y destruir bridge
             agentChannel.hangup().catch(() => {});
             clientChannel.hangup().catch(() => {});
             bridge.destroy().catch(() => {});
 
             // Notificar a AgentService que la llamada terminó
-            // El agentUserId lo resolvemos buscando por extensión en AgentService
-            const agents = this.agentService.getAgentsSnapshot();
-            const agent = agents.find(a => a.extension === agentExtension);
-            if (agent) {
-              await this.agentService.onAgentCallFinished(contactId, campaignId, agent.userId, durationSeconds);
-            }
+            await this.agentService.onAgentCallFinished(contactId, campaignId, agentUserId, durationSeconds);
           };
 
           agentChannel.once('StasisEnd', onEnd);
@@ -450,7 +451,6 @@ export class AmiService implements OnModuleInit {
   public async callWithTTS(text: string, phone: string, contactId: string): Promise<void> {
     const initialCallAttemptStartedAt = new Date();
 
-    // ─── AGREGADO: buscar campaignId del contacto antes de originar ───
     const contact = await this.campaigns.findContactById(contactId);
     const campaignId = contact?.campaign?.id || '';
     
@@ -478,7 +478,6 @@ export class AmiService implements OnModuleInit {
     for (const trunk of this.trunks) {
       let attemptSpecificStartedAt = new Date();
       try {
-        // ─── AGREGADO: pasar campaignId a tryCallRaw ───
         final = await this.tryCallRaw(contactId, campaignId, trunk, phone, audio, attemptSpecificStartedAt);
       } catch (e: any) {
         this.logger.error(`[${contactId}] Error tryCallRaw ${trunk}: ${e.message}`);
@@ -525,7 +524,7 @@ export class AmiService implements OnModuleInit {
 
   private async tryCallRaw(
     contactId: string,
-    campaignId: string,   // ─── AGREGADO ───
+    campaignId: string,
     trunk: string, 
     phone: string, 
     audio: string,
@@ -533,7 +532,6 @@ export class AmiService implements OnModuleInit {
   ): Promise<CallResult> {
     const callId = uuidv4();
     
-    // ─── AGREGADO: guardar campaignId en flags ───
     this.flags.set(callId, { 
       contactId, 
       campaignId,
